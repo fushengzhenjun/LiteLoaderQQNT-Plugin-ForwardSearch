@@ -711,6 +711,18 @@
     flex: 0 0 auto;
 }
 
+/* 详情页底部的说明条：告诉用户"这就是卡片封面上那几句"，别以为是全文 */
+.fs-note {
+    margin: 14px 2px 4px;
+    padding: 9px 12px;
+    font-size: 11.5px;
+    line-height: 1.7;
+    color: var(--fs-text-weak);
+    background: var(--fs-bg-sub);
+    border: 1px solid var(--fs-border);
+    border-radius: 8px;
+}
+
 .fs-msg-text {
     font-size: 13px;
     color: var(--fs-text);

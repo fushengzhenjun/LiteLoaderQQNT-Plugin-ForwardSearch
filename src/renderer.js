@@ -1222,6 +1222,11 @@ async function doSearch() {
     } finally {
         STATE.searching = false;
         renderResultsArea();
+        // 排障用：debugAutoOpenCard 打开时自动点开第一条结果，方便截图/远程看详情页
+        if (STATE.config && STATE.config.debugAutoOpenCard && STATE.results.length > 0 && !STATE.openCardDone) {
+            STATE.openCardDone = true;
+            setTimeout(() => openCard(STATE.results[0]), 600);
+        }
     }
 }
 
@@ -1245,6 +1250,27 @@ async function openCard(card) {
 let jumpNotice = '';
 
 /**
+ * 把卡片预览拆成一条条"谁说了什么"。
+ *
+ * 预览是卡片 XML 里那几行 `<title>`：第一行是卡片标题，后面每行是「昵称: 内容」，
+ * 用 " / " 连在一起。这些就是卡片封面上的真实内容，虽然只有前几条，
+ * 但比让用户对着一个空白页强得多。
+ */
+function splitPreview(preview) {
+    if (!preview) return [];
+    return String(preview)
+        .split(' / ')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+            // "昵称: 内容" 或 "昵称：内容"
+            const m = line.match(/^(.{1,24}?)[:：]\s*([\s\S]*)$/);
+            if (m && m[2]) return { name: m[1].trim(), text: m[2].trim() };
+            return { name: '', text: line };
+        });
+}
+
+/**
  * 尝试让 QQ 切到这张卡片所在的聊天。
  * 这是"尽力而为"：QQ 没有公开的"定位到某条消息"接口，
  * 但我们至少可以把用户带到那个群，剩下的靠他自己翻一下。
@@ -1252,28 +1278,87 @@ let jumpNotice = '';
 async function tryJumpToChat(card) {
     jumpNotice = '';
     if (!bridge || !STATE.config || !STATE.config.contentMode) {
-        jumpNotice = '仅本地模式下不会自动跳转，下面是卡片的完整内容。';
+        jumpNotice = '仅本地模式下不会自动跳转，下面是卡片的内容。';
         renderDetail();
         return;
     }
 
-    try {
-        const peer = peerOf(card);
-        const res = await bridge.nativeCall(
-            'nodeIKernelMsgService/getAioFirstViewLatestMsgsAndAddActiveChat',
-            [{ peer, cnt: 1 }, null],
-            true,
-            5000
-        );
-        if (res) {
-            jumpNotice = '已尝试帮你切到该聊天。如果没看到卡片，下面是完整内容。';
-        } else {
-            jumpNotice = '没能自动跳转，下面是卡片的完整内容。';
+    const peer = peerOf(card);
+    // 不同版本切会话的接口名字不一样，挨个试。
+    // 判断"真切过去了"不能只看应答码：应答只是 ack，拿到消息才算真的打开了这个会话。
+    const tries = [
+        { label: 'AddActiveChat', cmd: 'nodeIKernelMsgService/getAioFirstViewLatestMsgsAndAddActiveChat', payload: [{ peer, cnt: 10 }, null] },
+        { label: 'selectPeerChat', cmd: 'nodeIWindowApi/selectPeerChat', payload: [{ peer }, null] },
+        { label: 'selectPeerChat 简写', cmd: 'nodeIWindowApi/selectPeerChat', payload: [{ peerUid: peer.peerUid, chatType: peer.chatType }] }
+    ];
+
+    let acked = false;
+
+    for (const t of tries) {
+        try {
+            const res = await bridge.nativeCall(t.cmd, t.payload, true, 4000);
+            const msgs = res ? collectMessages(res, [], 0).length : 0;
+            const statue = res ? res.__statue || 'ok' : 'null';
+            diag(`[jump] ${t.label} → ${statue} / ${msgs} 条`);
+            if (msgs > 0) {
+                // 拿到这个会话的消息了，说明真的切过去了
+                const opened = clickChatInUi(card);
+                toast(
+                    opened
+                        ? `已打开「${card.peerName || '聊天'}」，往上翻一下就能看到那张卡片`
+                        : `已切到「${card.peerName || '聊天'}」，但界面没自动打开，点一下左边的会话即可`
+                );
+                setTimeout(() => closePanel(), 300);
+                return;
+            }
+            if (res && (statue === 'full' || statue === 'ok')) acked = true;
+        } catch (err) {
+            diag(`[jump] ${t.label} 抛异常 ${err}`);
         }
-    } catch (_) {
-        jumpNotice = '跳转失败，下面是卡片的完整内容。';
     }
+
+    // 接口应了但没拿到消息：可能切了但会话是空的，也可能根本没切。
+    // 这种情况不自动关面板，免得把用户丢在一个空界面上。
+    jumpNotice = acked
+        ? '已经帮你切过聊天了，如果没看到卡片，可以关掉这个面板去 QQ 里翻一下。'
+        : '没能自动跳到聊天，下面是这张卡片能读到的内容。';
     renderDetail();
+}
+
+/**
+ * 让 QQ 界面真的打开某个会话。
+ *
+ * 内核层的 AddActiveChat 只是把会话"激活"了（列表会顶到第一条），
+ * 但界面不会跟着切过去，右侧还是空白。所以这里补一步：
+ * 在会话列表里找到那一项，直接触发它自己的 click。
+ * 用的是元素 click，不是模拟鼠标，不会误点到别的东西。
+ */
+function clickChatInUi(card) {
+    const name = card && card.peerName;
+    if (!name || name === card.peerUid) return false;
+
+    // 会话项的类名是 .recent-contact-item（真机确认过）。
+    // 直接 .click() 不够：QQ 的列表是拖拽组件，只认完整的按下/抬起序列。
+    const items = Array.from(document.querySelectorAll('.recent-contact-item'));
+    const target = items.find((el) => (el.textContent || '').indexOf(name) !== -1);
+    if (!target) {
+        diag(`[jump] 列表里没有「${name}」（共 ${items.length} 项）`);
+        return false;
+    }
+
+    const opts = { bubbles: true, cancelable: true, view: window };
+    try {
+        target.dispatchEvent(new PointerEvent('pointerdown', opts));
+        target.dispatchEvent(new MouseEvent('mousedown', opts));
+        target.dispatchEvent(new PointerEvent('pointerup', opts));
+        target.dispatchEvent(new MouseEvent('mouseup', opts));
+        target.dispatchEvent(new MouseEvent('click', opts));
+        diag(`[jump] 已对「${name}」派发点击序列`);
+        return true;
+    } catch (err) {
+        diag(`[jump] 派发点击失败 ${err}`);
+        return false;
+    }
 }
 
 function renderDetail() {
@@ -1307,18 +1392,33 @@ function renderDetail() {
                 </div>`;
             })
             .join('');
-    } else if (card.innerState === 2) {
-        innerHtml = `<div class="fs-state">这张卡片的内容没能读出来。<br/>可能是消息太久远，或者已经被清理了。</div>`;
-    } else if (card.__filling) {
-        innerHtml = `<div class="fs-state">正在读取卡片内容，稍等一下…</div>`;
     } else {
-        innerHtml = `
-            <div class="fs-state">
-                <strong>内容还没补全</strong>
-                这张卡片里具体说了什么，现在本地还没存下来。
-                <div class="fs-hint">打开"内容补全"后会自动一条条补齐。</div>
-                <button class="fs-btn fs-act-crawl">开始补全</button>
-            </div>`;
+        // 拿不到完整正文（9.9.31 的 getMultiMsg 会被服务端拒），那就把封面上的内容摊开。
+        // 这几行本来就是卡片内部的原文，只是条数少而已。
+        const lines = splitPreview(card.preview);
+        if (lines.length > 0) {
+            innerHtml =
+                lines
+                    .map((m) => {
+                        const name = m.name || '';
+                        const initial = name ? Array.from(name)[0] : '…';
+                        return `
+                <div class="fs-msg">
+                    <div class="fs-avatar">${esc(initial)}</div>
+                    <div class="fs-msg-body">
+                        <div class="fs-msg-meta"><span class="fs-msg-name">${esc(name || '卡片内容')}</span></div>
+                        <div class="fs-msg-text">${highlight(m.text || '', STATE.query)}</div>
+                    </div>
+                </div>`;
+                    })
+                    .join('') +
+                `<div class="fs-note">以上是卡片封面上显示的内容${card.count ? `（这张卡共 ${card.count} 条）` : ''}。
+                 更靠后的消息，QQ 没有下发给插件，暂时读不到。</div>`;
+        } else if (card.innerState === 2) {
+            innerHtml = `<div class="fs-state">这张卡片的内容没能读出来。<br/>可能是消息太久远，或者已经被清理了。</div>`;
+        } else {
+            innerHtml = `<div class="fs-state">这张卡片本地没有存下任何内容。</div>`;
+        }
     }
 
     ui.body.innerHTML = `
