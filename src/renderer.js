@@ -1,0 +1,1874 @@
+/**
+ * 合并转发搜索 · 渲染层（界面 + 与 QQ 通信）
+ * ------------------------------------------------------------------
+ * 这是插件里最大的一块，按顺序分成 8 段，从上往下读就行：
+ *
+ *   1. 环境与工具函数
+ *   2. 主题跟随（自动识别 QQ 深色/浅色）
+ *   3. 跟 QQ 要数据的封装（kernel）
+ *   4. 内容补全队列（把卡片"里面"的文字拉回来）
+ *   5. 弹窗界面
+ *   6. 搜索逻辑
+ *   7. 详情面板
+ *   8. 设置页 & 启动
+ *
+ * 设计原则：所有可能失败的地方都要"兜住"，宁可少一个功能，也不能让 QQ 崩。
+ */
+
+/* ==================================================================
+ * 1. 环境与工具函数
+ * ================================================================== */
+
+const SLUG = 'forward-search';
+
+/** preload 暴露出来的接口。拿不到说明桥接层出问题了，后面会给出提示 */
+let bridge = typeof window !== 'undefined' ? window.forwardSearch : null;
+
+/** 诊断日志：写到主进程的 debug.log，真机排障用。任何阶段错了都能留痕。 */
+function diag(msg) {
+    try {
+        if (bridge && bridge.log) bridge.log(msg);
+    } catch (_) { /* 日志失败无所谓 */ }
+}
+
+if (typeof window !== 'undefined') {
+    // QQ 自己是 Vue + Web Components，偶尔会抛一些它自己的异常（local://root/... 那些）。
+    // 那些和我们无关，记进来只会把日志淹掉，所以只留来源是我们插件的。
+    const isOurs = (file) => {
+        const f = String(file || '');
+        return f.indexOf('forward-search') >= 0 || f.indexOf('plugins/forward-search') >= 0;
+    };
+
+    window.addEventListener('error', (e) => {
+        if (!isOurs(e && e.filename)) return;
+        diag(`[renderer:error] ${(e && e.message) || e} @ ${(e && e.filename) || '?'}:${(e && e.lineno) || '?'}`);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+        const reason = e && e.reason;
+        const stack = String((reason && (reason.stack || reason.message)) || reason || '');
+        if (!isOurs(stack)) return;
+        diag(`[renderer:reject] ${stack}`);
+    });
+    diag('[renderer] 模块已加载，桥接=' + (bridge ? 'ok' : 'missing'));
+}
+
+const STATE = {
+    open: false,
+    mode: 'search',       // search | detail | onboard
+    query: '',
+    results: [],
+    activeIndex: 0,
+    searching: false,
+    error: '',
+    config: null,
+    currentCard: null
+};
+
+/** 把 HTML 特殊字符转义，防止卡片里的文字把界面结构搞坏 */
+function esc(text) {
+    return String(text == null ? '' : text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+/** 把命中的关键词包上 <em>，用于高亮 */
+function highlight(text, query) {
+    const safe = esc(text);
+    if (!query) return safe;
+    const terms = String(query).toLowerCase().split(/\s+/).filter(Boolean);
+    let out = safe;
+    for (const t of terms) {
+        // 用不区分大小写的替换，同时对正则元字符转义
+        const pattern = new RegExp('(' + t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+        out = out.replace(pattern, '<em>$1</em>');
+    }
+    return out;
+}
+
+/** 时间戳（秒）→ 人看得懂的格式 */
+function formatTime(sec) {
+    if (!sec) return '';
+    const d = new Date(sec * 1000);
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const sameDay =
+        d.getFullYear() === now.getFullYear() &&
+        d.getMonth() === now.getMonth() &&
+        d.getDate() === now.getDate();
+    if (sameDay) return hm;
+    if (d.getFullYear() === now.getFullYear()) return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 防抖：输入停下来之后才真正去搜 */
+function debounce(fn, wait) {
+    let timer = null;
+    return function (...args) {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+            timer = null;
+            fn.apply(this, args);
+        }, wait);
+    };
+}
+
+/** 睡一会儿（补全队列限速用） */
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+/** 统一的日志前缀，方便在 QQ 日志里 grep */
+function log(...args) {
+    console.log('[forward-search]', ...args);
+}
+
+/* ==================================================================
+ * 2. 主题跟随
+ * ------------------------------------------------------------------
+ * 配置项 theme 有三种取值：
+ *   system（默认）  跟随系统深浅色，系统改了就跟着变
+ *   light / dark   用户手动锁定，忽略系统和 QQ
+ *   auto           旧版行为：看 QQ 自己页面的底色（保留兼容）
+ *
+ * 为什么默认用 system 而不是看 QQ 的底色：
+ * 读 QQ 界面颜色虽然"看起来更贴合"，但它依赖 QQ 的 DOM 结构，
+ * 每次 QQ 改版都可能失效；而系统深浅色是浏览器原生告诉我们的，稳定得多。
+ * ================================================================== */
+
+let currentTheme = 'light';
+
+/** 系统是不是深色。拿不到返回 null（老版本 Electron 可能没有 matchMedia） */
+function systemPrefersDark() {
+    try {
+        if (!window.matchMedia) return null;
+        return !!window.matchMedia('(prefers-color-scheme: dark)').matches;
+    } catch (_) {
+        return null;
+    }
+}
+
+/** 把 CSS 颜色字符串解析成 [r,g,b,a]，解析不了返回 null */
+function parseColor(str) {
+    if (!str) return null;
+    const m = String(str).match(/[\d.]+/g);
+    if (!m || m.length < 3) return null;
+    const r = Number(m[0]);
+    const g = Number(m[1]);
+    const b = Number(m[2]);
+    const a = m.length >= 4 ? Number(m[3]) : 1;
+    if (![r, g, b].every((n) => isFinite(n))) return null;
+    return [r, g, b, isFinite(a) ? a : 1];
+}
+
+/** 取某个元素自身背景色的亮度；全透明或没有颜色返回 null */
+function luminanceOf(el) {
+    const c = parseColor(getComputedStyle(el).backgroundColor);
+    if (!c || c[3] <= 0.1) return null; // 透明 = 这层没在画底色
+    return (0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]) / 255;
+}
+
+/** 从这个元素出发往上找第一个"真正在画底色"的层，返回 'light' / 'dark' / null */
+function themeFrom(el) {
+    let cur = el;
+    let depth = 0;
+    while (cur && depth < 12) {
+        const lum = luminanceOf(cur);
+        if (lum !== null) return lum < 0.5 ? 'dark' : 'light';
+        cur = cur.parentElement;
+        depth += 1;
+    }
+    return null;
+}
+
+function computeTheme() {
+    try {
+        const mode = (STATE.config && STATE.config.theme) || 'system';
+
+        // 手动锁定优先级最高
+        if (mode === 'light' || mode === 'dark') return mode;
+
+        // 跟随系统：auto 是历史写法，和 system 同义，都先看系统深浅色偏好；
+        // 系统偏好读不到（老系统/被禁用）才退回去看 QQ 自己的底色
+        const dark = systemPrefersDark();
+        if (dark !== null) return dark ? 'dark' : 'light';
+        return detectThemeFromDom();
+    } catch (_) {
+        return 'light';
+    }
+}
+
+/** 通过 QQ 界面的实际底色判断深浅（依赖 DOM 结构，只作为兜底） */
+function detectThemeFromDom() {
+    try {
+        if (!document.body) return 'light';
+
+        // 1) 从 body 往上找（最常见：body 或 html 上就写着底色）
+        //
+        // 但 QQ 的 body 背景常常是 rgba(0,0,0,0)（完全透明），
+        // 直接把 rgb 取出来算亮度会得到纯黑 → 浅色主题下弹窗被画成深色。
+        // 所以这里先看 alpha，透明就继续往上。
+        let t = themeFrom(document.body);
+        if (t) return t;
+
+        // 2) QQ 的底色往往画在 body 的子容器上（#app 之类），往上是找不到的。
+        //    取左上角那个点所在的元素往上找，等于问"这块地方实际是什么颜色"。
+        try {
+            if (document.elementFromPoint) {
+                const hit = document.elementFromPoint(2, 2);
+                // 别让弹窗自己的遮罩把自己算进去，否则会越套越深
+                if (hit && !(hit.closest && hit.closest('.fs-root'))) {
+                    t = themeFrom(hit);
+                    if (t) return t;
+                }
+            }
+        } catch (_) {
+            /* 取不到就继续往下面兜底 */
+        }
+
+        // 3) 兜底：扫 body 的直接子元素
+        const kids = document.body.children || [];
+        for (let i = 0; i < kids.length && i < 8; i += 1) {
+            t = themeFrom(kids[i]);
+            if (t) return t;
+        }
+
+        // 4) 实在判断不出来，退回系统的深浅色偏好
+        const dark = systemPrefersDark();
+        if (dark !== null) return dark ? 'dark' : 'light';
+        return 'light';
+    } catch (_) {
+        return 'light';
+    }
+}
+
+/** 把主题打到页面上所有 .fs-root 上（弹窗和设置页可能同时存在） */
+function applyTheme() {
+    const next = computeTheme();
+    if (next !== currentTheme) log('主题切换为', next);
+    currentTheme = next;
+    const roots = document.querySelectorAll('.fs-root');
+    for (let i = 0; i < roots.length; i += 1) {
+        // 入口按钮挂在 QQ 自己的顶栏上，得跟 QQ 的底色走，不能跟弹窗主题走
+        if (roots[i].classList.contains('fs-launcher') || roots[i].classList.contains('fs-float')) continue;
+        roots[i].setAttribute('data-fs-theme', next);
+    }
+    const launcher = document.querySelector('.fs-launcher');
+    if (launcher) launcher.setAttribute('data-fs-theme', detectThemeFromDom());
+    // 悬浮按钮浮在 QQ 内容上，同理跟 QQ 底色走
+    const floatBtn = document.querySelector('.fs-float');
+    if (floatBtn) floatBtn.setAttribute('data-fs-theme', detectThemeFromDom());
+}
+
+function watchTheme() {
+    // 1) 系统深浅色变化 —— "跟随系统"模式靠它
+    try {
+        if (window.matchMedia) {
+            const mq = window.matchMedia('(prefers-color-scheme: dark)');
+            const onChange = () => applyTheme();
+            if (mq.addEventListener) mq.addEventListener('change', onChange);
+            else if (mq.addListener) mq.addListener(onChange); // 老版本 Electron 只有这个
+        }
+    } catch (_) {
+        /* 没有 matchMedia 也不影响，下面还有 DOM 监听 */
+    }
+
+    // 2) QQ 自己切主题 —— auto 模式和兜底逻辑靠它
+    try {
+        const observer = new MutationObserver(() => applyTheme());
+        observer.observe(document.body, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] });
+        // 有些版本不改 body，改的是 html，顺带也看一眼
+        observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class', 'style'] });
+    } catch (_) {
+        /* 监听失败就只在打开弹窗时判断一次，也能用 */
+    }
+}
+
+/* ==================================================================
+ * 3. 跟 QQ 要数据
+ * ------------------------------------------------------------------
+ * 说明一个很现实的问题：QQ 没有对外公开"给我某条合并转发的全部内容"这种接口，
+ * 这些方法名和参数是社区长期摸索出来的，不同版本可能微妙变化。
+ *
+ * 所以这里的策略是：
+ *   a) 同一个操作准备几种可能的调用写法，挨个试，哪个能返回东西就用哪个
+ *   b) 拿到返回后不假设结构，而是"深度遍历找长得像消息的东西"
+ *   c) 全都失败就安静地降级，不弹错、不崩
+ *
+ * 这样即使 QQ 改版，最多是"内容补全暂时不可用"，基础搜索仍然正常。
+ * ================================================================== */
+
+/** 把 QQ 返回里所有"像消息"的对象都捞出来（带 msgId 和 elements 的） */
+function collectMessages(node, out, depth) {
+    if (!node || typeof node !== 'object' || depth > 6) return out;
+    if (Array.isArray(node)) {
+        for (const item of node) collectMessages(item, out, depth + 1);
+        return out;
+    }
+    if (node.msgId && Array.isArray(node.elements)) {
+        out.push(node);
+    }
+    for (const key of Object.keys(node)) {
+        const v = node[key];
+        if (v && typeof v === 'object') collectMessages(v, out, depth + 1);
+    }
+    return out;
+}
+
+/** 调一次 QQ 接口。返回 null 表示这次没成功。 */
+async function callKernel(cmdName, payload, awaitMode) {
+    if (!bridge || !bridge.nativeCall) return null;
+    try {
+        return await bridge.nativeCall(cmdName, payload, awaitMode, 5000);
+    } catch (err) {
+        log('调用失败', cmdName, err);
+        return null;
+    }
+}
+
+/**
+ * 用几种常见写法去请求同一个能力，返回第一个成功的结果。
+ *
+ * 关键点是 budgetMs：如果没有总时间预算，五种写法各自超时叠加起来
+ * 会让界面卡住半分钟，这绝对不能接受。所以这里给一个总预算，
+ * 超了就放弃剩下的尝试，直接走降级。
+ *
+ * @param {Array} tries [{cmdName, payload, awaitMode}]
+ * @param {number} budgetMs 总预算
+ */
+async function callKernelAny(tries, budgetMs = 11000) {
+    const start = Date.now();
+    for (const t of tries) {
+        if (Date.now() - start > budgetMs) break;
+        const res = await callKernel(t.cmdName, t.payload, t.awaitMode);
+        if (!res) continue;
+        const msgs = collectMessages(res, [], 0);
+        if (msgs.length > 0) return { res, msgs };
+    }
+    return null;
+}
+
+/** 构造 QQ 接口要的会话对象 */
+function peerOf(card) {
+    return {
+        chatType: card.chatType || 2,
+        peerUid: card.peerUid || '',
+        guildId: '',
+        name: card.peerName || ''
+    };
+}
+
+/**
+ * 拉取一张卡片"里面"的消息。
+ * @param {object} card
+ * @param {number} budgetMs 总时间预算，用户正在等的情况下给少一点
+ * @returns {Promise<Array|null>} 成功返回子消息数组，失败返回 null
+ */
+async function fetchCardInner(card, budgetMs = 11000) {
+    if (!card || !card.msgId) return null;
+    const peer = peerOf(card);
+
+    const tries = [
+        // 写法一：对象参数 + 等同 callbackId 的回复
+        { cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [{ peer, msgId: card.msgId }, null], awaitMode: true },
+        // 写法二：位置参数
+        { cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [peer, card.msgId, null], awaitMode: true },
+        // 写法三：有些版本合并转发内容会挂在消息列表更新事件里
+        {
+            cmdName: 'nodeIKernelMsgService/getMultiMsg',
+            payload: [{ peer, msgId: card.msgId }, null],
+            awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate', 'nodeIKernelMsgListener/onMsgRecordChange']
+        },
+        // 写法四：退而求其次，只要拿回这条外层消息，它可能自带 records
+        { cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf', payload: [peer, card.msgId, 1, true], awaitMode: true },
+        {
+            cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf',
+            payload: [{ peer, msgId: card.msgId, cnt: 1, queryOrder: true }, null],
+            awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate']
+        }
+    ];
+
+    const hit = await callKernelAny(tries, budgetMs);
+    if (!hit) return null;
+
+    // 从返回的消息里，把真正属于"卡片内部"的内容挑出来
+    const record = requireRecordParser();
+    const inner = [];
+    for (const msg of hit.msgs) {
+        // 如果这条就是卡片本身，并且它自带 records，直接解析
+        const fromRecords = record ? record.parseInnerRecords(msg.records) : [];
+        if (fromRecords.length > 0) {
+            for (const m of fromRecords) inner.push(m);
+            continue;
+        }
+        // 否则把这条当成卡片里的一条子消息
+        if (record) {
+            const text = record.messageToText(msg);
+            if (text) {
+                inner.push({
+                    name:
+                        msg.sendMemberName ||
+                        msg.sendNickName ||
+                        msg.senderName ||
+                        msg.peerName ||
+                        '未知',
+                    time: record.normalizeTime(msg.msgTime),
+                    text: text.slice(0, 1500)
+                });
+            }
+        }
+    }
+
+    // 去重（同一段话重复出现多半是重复抓取）
+    const unique = [];
+    const seen = new Set();
+    for (const m of inner) {
+        const key = m.name + '|' + m.text;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(m);
+    }
+
+    return unique.length > 0 ? unique : null;
+}
+
+/**
+ * 渲染层拿不到 CommonJS 的 record.js，这里放一个极简版解析器。
+ * （主进程和 preload 用的是完整版，界面层只需要最基础的文本提取）
+ */
+let _recordParser = null;
+function requireRecordParser() {
+    if (_recordParser) return _recordParser;
+    _recordParser = {
+        normalizeTime(value) {
+            const n = Number(value);
+            if (!Number.isFinite(n) || n <= 0) return 0;
+            return n > 1e11 ? Math.floor(n / 1000) : Math.floor(n);
+        },
+        parseInnerRecords(records) {
+            if (!Array.isArray(records)) return [];
+            const out = [];
+            for (const rec of records) {
+                const msg = rec && rec.message ? rec.message : rec;
+                if (!msg || !Array.isArray(msg.elements)) continue;
+                const text = this.messageToText(msg);
+                if (!text) continue;
+                out.push({
+                    name: msg.sendMemberName || msg.sendNickName || msg.senderName || '未知',
+                    time: this.normalizeTime(msg.msgTime),
+                    text: text.slice(0, 1500)
+                });
+            }
+            return out;
+        },
+        messageToText(msg) {
+            if (!msg || !Array.isArray(msg.elements)) return '';
+            const parts = [];
+            for (const el of msg.elements) {
+                if (!el) continue;
+                if (el.textElement) parts.push(el.textElement.content || '');
+                else if (el.picElement) parts.push('[图片]');
+                else if (el.fileElement) parts.push('[文件] ' + (el.fileElement.fileName || ''));
+                else if (el.pttElement) parts.push('[语音]');
+                else if (el.videoElement) parts.push('[视频]');
+                else if (el.faceElement) parts.push(el.faceElement.faceText || '[表情]');
+                else if (el.arkElement) parts.push('[卡片]');
+            }
+            return parts.join(' ').replace(/\s+/g, ' ').trim();
+        }
+    };
+    return _recordParser;
+}
+
+/* ==================================================================
+ * 4. 内容补全队列
+ * ------------------------------------------------------------------
+ * 这是唯一会主动"联网"的部分，所以做得非常保守：
+ *   - 默认关闭，必须用户明确同意才跑
+ *   - 一次只处理一条，两条之间强制等待（带随机浮动）
+ *   - 随时可以暂停，进度存在内存里，界面能看到
+ * ================================================================== */
+
+const crawler = {
+    running: false,
+    paused: false,
+    total: 0,
+    done: 0,
+    failed: 0,
+    lastError: '',
+    _stop: false
+};
+
+async function runCrawl() {
+    if (crawler.running) return;
+    if (!STATE.config || !STATE.config.contentMode) {
+        toast('当前是"仅本地模式"，请先在设置里打开内容补全');
+        return;
+    }
+    if (!bridge) {
+        toast('桥接层未加载，无法补全');
+        return;
+    }
+
+    crawler.running = true;
+    crawler.paused = false;
+    crawler._stop = false;
+    crawler.done = 0;
+    crawler.failed = 0;
+    crawler.lastError = '';
+    renderCrawlStatus();
+
+    const interval = Math.max(600, Number(STATE.config.crawlIntervalMs) || 1600);
+    const jitter = Math.max(0, Number(STATE.config.crawlJitterMs) || 700);
+
+    try {
+        // 分批取，边跑边存，QQ 关掉也不会白跑
+        for (let round = 0; round < 200; round++) {
+            if (crawler._stop) break;
+            while (crawler.paused) {
+                await sleep(400);
+                if (crawler._stop) break;
+            }
+            if (crawler._stop) break;
+
+            const batch = await bridge.pending(60, {});
+            const list = (batch && batch.ok ? batch.data : []) || [];
+            if (list.length === 0) break;
+            crawler.total = crawler.done + list.length;
+
+            for (const card of list) {
+                if (crawler._stop) break;
+                while (crawler.paused) {
+                    await sleep(400);
+                    if (crawler._stop) break;
+                }
+                if (crawler._stop) break;
+
+                renderCrawlStatus();
+                let inner = null;
+                try {
+                    inner = await fetchCardInner(card);
+                } catch (err) {
+                    crawler.lastError = String(err && err.message ? err.message : err);
+                }
+
+                if (inner && inner.length > 0) {
+                    await bridge.setInner(card.id, inner, 1);
+                    crawler.done++;
+                } else {
+                    await bridge.setInner(card.id, [], 2);
+                    crawler.failed++;
+                }
+
+                // 限速：固定间隔 + 随机浮动，别让请求节奏显得太机器
+                const wait = interval + Math.floor(Math.random() * jitter);
+                await sleep(wait);
+            }
+        }
+    } finally {
+        crawler.running = false;
+        renderCrawlStatus();
+        try {
+            if (bridge) await bridge.compact();
+        } catch (_) {
+            /* 压缩失败无所谓 */
+        }
+    }
+}
+
+/**
+ * 历史扫描：把某个会话的历史消息过一遍，把里面的合并转发卡片都收进来。
+ * 注意：这一步请求量比较大，所以只在用户主动点"扫描历史"时执行。
+ */
+async function scanHistory(limitPerPeer = 200) {
+    if (!bridge) return;
+    if (!STATE.config || !STATE.config.contentMode) {
+        toast('扫描历史需要先打开内容补全模式');
+        return;
+    }
+
+    crawler.running = true;
+    crawler.paused = false;
+    crawler._stop = false;
+    crawler.done = 0;
+    crawler.failed = 0;
+    renderCrawlStatus();
+
+    try {
+        const peers = await listPeers();
+        if (!peers.length) {
+            toast('没能取到会话列表，无法扫描');
+            return;
+        }
+
+        const interval = Math.max(800, Number(STATE.config.crawlIntervalMs) || 1600);
+
+        for (const peer of peers) {
+            if (crawler._stop) break;
+            let anchor = '0';
+            let fetched = 0;
+
+            while (fetched < limitPerPeer && !crawler._stop) {
+                const hit = await callKernelAny([
+                    {
+                        cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf',
+                        payload: [peer, anchor, 20, true],
+                        awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate']
+                    },
+                    {
+                        cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf',
+                        payload: [{ peer, msgId: anchor, cnt: 20, queryOrder: true }, null],
+                        awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate']
+                    }
+                ]);
+
+                if (!hit || hit.msgs.length === 0) break;
+
+                const cards = [];
+                for (const msg of hit.msgs) {
+                    const card = toCard(msg, peer);
+                    if (card) cards.push(card);
+                }
+                if (cards.length > 0) await bridge.upsert(cards);
+
+                fetched += hit.msgs.length;
+                crawler.done += cards.length;
+                renderCrawlStatus();
+
+                // 下一页的锚点：这一页最早的那条
+                const sorted = hit.msgs
+                    .map((m) => String(m.msgId || ''))
+                    .filter(Boolean);
+                const nextAnchor = sorted[sorted.length - 1];
+                if (!nextAnchor || nextAnchor === anchor) break;
+                anchor = nextAnchor;
+
+                await sleep(interval);
+            }
+        }
+    } finally {
+        crawler.running = false;
+        renderCrawlStatus();
+        refreshStats();
+    }
+}
+
+/** 取会话列表（最近联系人），用来知道"有哪些群/好友可以扫" */
+async function listPeers() {
+    const tries = [
+        {
+            cmdName: 'nodeIKernelRecentContactService/getRecentContactList',
+            payload: [{ count: 200 }],
+            awaitMode: true
+        },
+        {
+            cmdName: 'nodeIKernelRecentContactService/getRecentContactList',
+            payload: [{ count: 200 }, null],
+            awaitMode: ['nodeIKernelRecentContactListener/onRecentContactListChanged']
+        },
+        { cmdName: 'nodeIKernelRecentContactService/getRecentContactList', payload: [], awaitMode: true }
+    ];
+
+    for (const t of tries) {
+        const res = await callKernel(t.cmdName, t.payload, t.awaitMode);
+        if (!res) continue;
+        const out = [];
+        const walk = (node, depth) => {
+            if (!node || typeof node !== 'object' || depth > 6) return;
+            if (Array.isArray(node)) {
+                node.forEach((n) => walk(n, depth + 1));
+                return;
+            }
+            if (node.peerUid && (node.chatType !== undefined || node.peerType !== undefined)) {
+                const name = node.peerName || node.remark || node.sendMemberName || '';
+                const uid = node.peerUid;
+                out.push({
+                    chatType: Number(node.chatType || node.peerType || 2),
+                    peerUid: uid,
+                    guildId: '',
+                    name: name
+                });
+                if (name) out[out.length - 1].__name = name;
+            }
+            Object.values(node).forEach((v) => {
+                if (v && typeof v === 'object') walk(v, depth + 1);
+            });
+        };
+        walk(res, 0);
+        if (out.length > 0) {
+            // 去重
+            const seen = new Set();
+            return out.filter((p) => {
+                const k = p.chatType + ':' + p.peerUid;
+                if (seen.has(k)) return false;
+                seen.add(k);
+                return true;
+            });
+        }
+    }
+    return [];
+}
+
+/** 把一条消息尝试转成卡片（界面层用的轻量版，实际解析在主进程/preload） */
+function toCard(msg, peer) {
+    if (!msg || !Array.isArray(msg.elements)) return null;
+    for (const el of msg.elements) {
+        if (!el || !el.arkElement) continue;
+        const raw = el.arkElement.bytesData;
+        if (typeof raw !== 'string' || raw.indexOf('multimsg') === -1) continue;
+        let json = null;
+        try {
+            json = JSON.parse(raw);
+        } catch (_) {
+            continue;
+        }
+        const detail = (json.meta && json.meta.detail) || {};
+        const resid = detail.m_resid || detail.resid || '';
+        if (!resid) continue;
+        // news 有的版本是数组，有的版本是单个对象，都要兼容
+        let title = '';
+        if (Array.isArray(detail.news) && detail.news[0]) title = detail.news[0].text || '';
+        else if (detail.news && typeof detail.news === 'object') title = detail.news.text || '';
+        return {
+            id: `${peer.chatType}:${peer.peerUid}:${msg.msgId}`,
+            chatType: peer.chatType,
+            peerUid: peer.peerUid,
+            peerName: peer.__name || peer.name || peer.peerUid,
+            msgId: String(msg.msgId || ''),
+            msgSeq: String(msg.msgSeq || ''),
+            msgTime: requireRecordParser().normalizeTime(msg.msgTime),
+            senderName: msg.sendMemberName || msg.sendNickName || '',
+            title: title || '聊天记录',
+            preview: detail.source || '',
+            count: parseInt((detail.summary || '').replace(/\D/g, ''), 10) || 0,
+            resid: resid,
+            fileName: detail.m_fileName || '',
+            innerState: 0,
+            inner: []
+        };
+    }
+    return null;
+}
+
+/* ==================================================================
+ * 5. 弹窗界面
+ * ================================================================== */
+
+let ui = null;
+
+async function injectStyleOnce() {
+    if (document.getElementById('fs-style')) return;
+    // getStyle 现在是异步的（样式表由主进程代读，preload 沙箱里没有 fs）
+    let css = '';
+    try {
+        css = bridge && bridge.getStyle ? await bridge.getStyle() : '';
+    } catch (err) {
+        log('读取样式失败', err);
+    }
+    if (!css) {
+        log('样式表为空，界面可能会比较朴素');
+        return;
+    }
+    const style = document.createElement('style');
+    style.id = 'fs-style';
+    style.textContent = css;
+    document.head.appendChild(style);
+}
+
+function buildUi() {
+    if (ui) return ui;
+
+    const mask = document.createElement('div');
+    mask.className = 'fs-root fs-mask';
+    mask.setAttribute('data-fs-theme', currentTheme);
+    mask.style.display = 'none';
+    mask.innerHTML = `
+        <div class="fs-panel" role="dialog" aria-label="合并转发搜索">
+            <div class="fs-search">
+                <svg class="fs-search-icon" viewBox="0 0 16 16" fill="none">
+                    <circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/>
+                    <path d="M11 11L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                </svg>
+                <input class="fs-input" type="text" spellcheck="false" placeholder="搜索合并转发卡片里的内容…" />
+                <span class="fs-hotkey"></span>
+            </div>
+            <div class="fs-body"></div>
+            <div class="fs-foot">
+                <span class="fs-foot-stat"></span>
+                <span class="fs-foot-spacer"></span>
+                <a class="fs-link fs-link-scan">扫描历史</a>
+                <a class="fs-link fs-link-settings">设置</a>
+                <span class="fs-keyhint"><kbd>Esc</kbd>关闭</span>
+                <span class="fs-keyhint"><kbd>↑</kbd><kbd>↓</kbd>选择</span>
+                <span class="fs-keyhint fs-keyhint-enter"><kbd>Enter</kbd>打开</span>
+            </div>
+        </div>`;
+    document.body.appendChild(mask);
+
+
+    const input = mask.querySelector('.fs-input');
+    const body = mask.querySelector('.fs-body');
+
+    // 搜索框右边那个小胶囊显示当前快捷键，提醒用户下次可以直接按
+    const hotkeyTip = mask.querySelector('.fs-hotkey');
+    if (hotkeyTip) hotkeyTip.textContent = (STATE.config && STATE.config.hotkey) || 'Alt+S';
+
+    // 点击遮罩空白处关闭
+    mask.addEventListener('mousedown', (e) => {
+        if (e.target === mask) closePanel();
+    });
+
+    // 输入 → 防抖搜索
+    const debounced = debounce(() => {
+        STATE.query = input.value.trim();
+        STATE.activeIndex = 0;
+        doSearch();
+    }, (STATE.config && STATE.config.debounce) || 220);
+    input.addEventListener('input', debounced);
+
+    // 键盘操作
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            moveActive(1);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            moveActive(-1);
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            openActive();
+        }
+    });
+
+    mask.querySelector('.fs-link-settings').addEventListener('click', () => {
+        openSettingsHint();
+    });
+
+    // 扫描历史：把各个会话翻一遍，把里面的合并转发卡片收进索引
+    mask.querySelector('.fs-link-scan').addEventListener('click', async () => {
+        if (crawler.running) {
+            // 正在跑的时候点一下 = 暂停/继续
+            crawler.paused = !crawler.paused;
+            renderCrawlStatus();
+            return;
+        }
+        const yes = confirm(
+            '扫描历史会逐个打开你的会话翻看聊天记录，把里面的合并转发卡片收进索引。\n\n' +
+                '这会向 QQ 的服务器发出一些请求，数量取决于你的聊天量。建议在空闲时进行，中途可以点"暂停"。\n\n' +
+                '确定开始吗？'
+        );
+        if (!yes) return;
+        await scanHistory(200);
+    });
+
+    ui = { mask, panel: mask.querySelector('.fs-panel'), input, body };
+    return ui;
+}
+
+/** 打开弹窗（异步：样式表要从主进程取） */
+async function openPanel() {
+    await injectStyleOnce();
+    buildUi();
+    applyTheme();
+
+    if (STATE.config && STATE.config.onboarded === false) {
+        renderOnboard();
+    } else {
+        STATE.mode = 'search';
+        renderResultsArea();
+        if (STATE.query) doSearch();
+    }
+
+    ui.mask.style.display = 'flex';
+    STATE.open = true;
+    setTimeout(() => ui.input.focus(), 30);
+    refreshStats();
+}
+
+function closePanel() {
+    if (!ui) return;
+    ui.mask.style.display = 'none';
+    STATE.open = false;
+    STATE.mode = 'search';
+    if (ui.input) ui.input.value = STATE.query = '';
+}
+
+/* ---------- 各区域的渲染 ---------- */
+
+function renderResultsArea() {
+    if (!ui) return;
+    const body = ui.body;
+
+    if (STATE.mode === 'detail') return renderDetail();
+    if (STATE.mode === 'onboard') return renderOnboard();
+
+    if (STATE.error) {
+        body.innerHTML = `
+            <div class="fs-state">
+                <strong>出了点问题</strong>
+                ${esc(STATE.error)}
+                <div class="fs-hint">可以先试试关掉弹窗再打开，或者重新输入关键词。</div>
+            </div>`;
+        return;
+    }
+
+    if (STATE.searching) {
+        body.innerHTML = `
+            <div class="fs-skeleton">
+                <div class="fs-sk-line" style="width:70%"></div>
+                <div class="fs-sk-line" style="width:45%"></div>
+                <div class="fs-sk-line" style="width:62%"></div>
+            </div>`;
+        return;
+    }
+
+    if (!STATE.query) {
+        body.innerHTML = `
+            <div class="fs-state fs-state-empty">
+                <div class="fs-art">
+                    <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
+                        <rect x="10" y="14" width="34" height="26" rx="6" stroke="currentColor" stroke-width="2.2" opacity=".55"/>
+                        <path d="M17 24h20M17 31h13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".38"/>
+                        <circle cx="42" cy="42" r="10" stroke="currentColor" stroke-width="2.4"/>
+                        <path d="M49.5 49.5L56 56" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <strong>输入关键词开始找</strong>
+                搜的是整张合并转发卡片，包括卡片里面的聊天内容。<br/>
+                比如搜一句你在转发里看到过的话。
+                <div class="fs-hint">关键词可以用空格分开，表示"同时包含"。</div>
+            </div>`;
+        return;
+    }
+
+    if (STATE.results.length === 0) {
+        body.innerHTML = `
+            <div class="fs-state">
+                <strong>没有找到匹配的卡片</strong>
+                换个词试试？或者看看是不是还没补全内容。
+                <div class="fs-hint">卡片内容如果没补全，只能搜到标题和摘要。</div>
+                <button class="fs-btn fs-btn-ghost fs-act-crawl">去补全内容</button>
+            </div>`;
+        const btn = body.querySelector('.fs-act-crawl');
+        if (btn) btn.addEventListener('click', () => runCrawl());
+        return;
+    }
+
+    body.innerHTML = STATE.results
+        .map((card, i) => {
+            const active = i === STATE.activeIndex ? ' is-active' : '';
+            const countBadge = card.count > 0 ? `<span class="fs-badge">共 ${card.count} 条</span>` : '';
+            const pending = card.innerState === 0 ? '<span class="fs-badge" style="opacity:.6">内容未补全</span>' : '';
+            return `
+                <div class="fs-item${active}" data-index="${i}">
+                    <div class="fs-item-head">
+                        <span class="fs-item-group">${esc(card.peerName || '未知群聊')}</span>
+                        <span class="fs-dot"></span>
+                        <span class="fs-item-time">${formatTime(card.msgTime)}</span>
+                        ${countBadge}${pending}
+                    </div>
+                    <div class="fs-item-title">${highlight(card.title || '聊天记录', STATE.query)}</div>
+                    <div class="fs-item-preview">${highlight(card.preview || '（无摘要）', STATE.query)}</div>
+                </div>`;
+        })
+        .join('');
+
+    body.querySelectorAll('.fs-item').forEach((el) => {
+        el.addEventListener('click', () => {
+            const idx = Number(el.dataset.index);
+            STATE.activeIndex = idx;
+            openCard(STATE.results[idx]);
+        });
+        el.addEventListener('mouseenter', () => {
+            STATE.activeIndex = Number(el.dataset.index);
+            body.querySelectorAll('.fs-item').forEach((n) => n.classList.remove('is-active'));
+            el.classList.add('is-active');
+        });
+    });
+}
+
+function moveActive(delta) {
+    if (STATE.results.length === 0) return;
+    STATE.activeIndex = (STATE.activeIndex + delta + STATE.results.length) % STATE.results.length;
+    const nodes = ui.body.querySelectorAll('.fs-item');
+    nodes.forEach((n, i) => n.classList.toggle('is-active', i === STATE.activeIndex));
+    const active = nodes[STATE.activeIndex];
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+}
+
+function openActive() {
+    const card = STATE.results[STATE.activeIndex];
+    if (card) openCard(card);
+}
+
+/* ==================================================================
+ * 6. 搜索
+ * ================================================================== */
+
+async function doSearch() {
+    if (!ui) return;
+    STATE.error = '';
+
+    if (!STATE.query) {
+        renderResultsArea();
+        return;
+    }
+
+    if (!bridge) {
+        STATE.error = '插件桥接层没有加载成功，请重启 QQ 再试。';
+        STATE.searching = false;
+        renderResultsArea();
+        return;
+    }
+
+    STATE.searching = true;
+    renderResultsArea();
+
+    try {
+        const res = await bridge.search(STATE.query, (STATE.config && STATE.config.maxResults) || 60);
+        if (!res || !res.ok) {
+            throw new Error((res && res.error) || '搜索失败');
+        }
+        STATE.results = res.data || [];
+
+        // 群名兜底：早期收录的记录可能没有群名，用缓存补一下
+        for (const card of STATE.results) {
+            if ((!card.peerName || card.peerName === card.peerUid) && bridge.getPeerName) {
+                const name = bridge.getPeerName(card.peerUid);
+                if (name) card.peerName = name;
+            }
+        }
+    } catch (err) {
+        STATE.results = [];
+        STATE.error = '搜索时出错：' + String((err && err.message) || err);
+    } finally {
+        STATE.searching = false;
+        renderResultsArea();
+    }
+}
+
+/* ==================================================================
+ * 7. 详情面板
+ * ------------------------------------------------------------------
+ * 需求里说得很清楚：跳转失败不能崩，要直接把内容摊开给用户看。
+ * 所以这里的逻辑是"先尽力跳到聊天，然后无论如何都展示全文"。
+ * ================================================================== */
+
+async function openCard(card) {
+    if (!card) return;
+    STATE.currentCard = card;
+    STATE.mode = 'detail';
+    renderDetail();
+
+    // 顺手试一下跳到聊天窗口。跳不过去也没关系，详情已经显示出来了。
+    tryJumpToChat(card);
+}
+
+let jumpNotice = '';
+
+/**
+ * 尝试让 QQ 切到这张卡片所在的聊天。
+ * 这是"尽力而为"：QQ 没有公开的"定位到某条消息"接口，
+ * 但我们至少可以把用户带到那个群，剩下的靠他自己翻一下。
+ */
+async function tryJumpToChat(card) {
+    jumpNotice = '';
+    if (!bridge || !STATE.config || !STATE.config.contentMode) {
+        jumpNotice = '仅本地模式下不会自动跳转，下面是卡片的完整内容。';
+        renderDetail();
+        return;
+    }
+
+    try {
+        const peer = peerOf(card);
+        const res = await bridge.nativeCall(
+            'nodeIKernelMsgService/getAioFirstViewLatestMsgsAndAddActiveChat',
+            [{ peer, cnt: 1 }, null],
+            true,
+            5000
+        );
+        if (res) {
+            jumpNotice = '已尝试帮你切到该聊天。如果没看到卡片，下面是完整内容。';
+        } else {
+            jumpNotice = '没能自动跳转，下面是卡片的完整内容。';
+        }
+    } catch (_) {
+        jumpNotice = '跳转失败，下面是卡片的完整内容。';
+    }
+    renderDetail();
+}
+
+function renderDetail() {
+    if (!ui) return;
+    const card = STATE.currentCard;
+    if (!card) {
+        STATE.mode = 'search';
+        renderResultsArea();
+        return;
+    }
+
+    const inner = card.inner || [];
+    let innerHtml = '';
+
+    if (inner.length > 0) {
+        innerHtml = inner
+            .map((m) => {
+                const name = m.name || '未知';
+                const initial = Array.from(name)[0] || '?';
+                const timeHtml = m.time ? `<span class="fs-msg-time">${formatTime(m.time)}</span>` : '';
+                return `
+                <div class="fs-msg">
+                    <div class="fs-avatar">${esc(initial)}</div>
+                    <div class="fs-msg-body">
+                        <div class="fs-msg-meta">
+                            <span class="fs-msg-name">${esc(name)}</span>
+                            ${timeHtml}
+                        </div>
+                        <div class="fs-msg-text">${highlight(m.text || '', STATE.query)}</div>
+                    </div>
+                </div>`;
+            })
+            .join('');
+    } else if (card.innerState === 2) {
+        innerHtml = `<div class="fs-state">这张卡片的内容没能读出来。<br/>可能是消息太久远，或者已经被清理了。</div>`;
+    } else if (card.__filling) {
+        innerHtml = `<div class="fs-state">正在读取卡片内容，稍等一下…</div>`;
+    } else {
+        innerHtml = `
+            <div class="fs-state">
+                <strong>内容还没补全</strong>
+                这张卡片里具体说了什么，现在本地还没存下来。
+                <div class="fs-hint">打开"内容补全"后会自动一条条补齐。</div>
+                <button class="fs-btn fs-act-crawl">开始补全</button>
+            </div>`;
+    }
+
+    ui.body.innerHTML = `
+        <div class="fs-detail">
+            <div class="fs-detail-head">
+                <div class="fs-detail-title">${esc(card.title || '聊天记录')}</div>
+                <div class="fs-detail-sub">
+                    ${esc(card.peerName || '未知群聊')} · ${formatTime(card.msgTime)}
+                    ${card.count ? ' · 共 ' + card.count + ' 条' : ''}
+                    ${jumpNotice ? '<br/>' + esc(jumpNotice) : ''}
+                </div>
+            </div>
+            <div class="fs-detail-list">${innerHtml}</div>
+            <div class="fs-foot">
+                <a class="fs-link fs-act-back">← 返回搜索结果</a>
+                <span class="fs-foot-spacer"></span>
+                <span>Esc 关闭</span>
+            </div>
+        </div>`;
+
+    const back = ui.body.querySelector('.fs-act-back');
+    if (back) {
+        back.addEventListener('click', () => {
+            STATE.mode = 'search';
+            STATE.currentCard = null;
+            renderResultsArea();
+        });
+    }
+    const crawlBtn = ui.body.querySelector('.fs-act-crawl');
+    if (crawlBtn) crawlBtn.addEventListener('click', () => runCrawl());
+
+    // 如果本地没内容，顺便试着补一下（仅在允许联网时）
+    if (inner.length === 0 && card.innerState === 0 && !card.__filling && STATE.config && STATE.config.contentMode) {
+        fillThisCard(card);
+    }
+}
+
+/**
+ * 只补当前这一张（用户正等着看，所以给的时间预算比批量补全短）。
+ * __filling 这个标记很重要：没有它，renderDetail 和 fillThisCard 会互相触发成死循环。
+ */
+async function fillThisCard(card) {
+    if (card.__filling) return;
+    card.__filling = true;
+    renderDetail();
+    try {
+        const inner = await fetchCardInner(card, 8000);
+        if (inner && inner.length > 0) {
+            await bridge.setInner(card.id, inner, 1);
+            card.inner = inner;
+            card.innerState = 1;
+        } else {
+            card.innerState = 2;
+        }
+    } catch (_) {
+        /* 补不到就算了，界面上已经有降级提示 */
+        card.innerState = 2;
+    } finally {
+        card.__filling = false;
+        if (STATE.currentCard && STATE.currentCard.id === card.id && STATE.mode === 'detail') {
+            renderDetail();
+        }
+    }
+}
+
+/* ==================================================================
+ * 8. 引导页 / 设置 / 启动
+ * ================================================================== */
+
+function renderOnboard() {
+    if (!ui) return;
+    STATE.mode = 'onboard';
+    ui.body.innerHTML = `
+        <div class="fs-onboard">
+            <h3>第一次用，先花 30 秒看一下</h3>
+            <p>这个插件帮你按"内容"找合并转发卡片——搜的是卡片里面说过的话，不只是外面那行摘要。</p>
+
+            <div class="fs-note">
+                这里要说清楚一件事：<b>QQ 的合并转发卡片，里面那些消息并不存在你电脑上</b>。
+                你点开卡片时，QQ 才去服务器拉一次。所以想搜到"里面的内容"，插件也必须去拉一次。
+            </div>
+
+            <p>因此有两种用法，你选一个：</p>
+            <ul>
+                <li><b>仅本地模式（推荐先用这个）</b><br/>完全不联网。你打开过的卡片、别人发来时装过的内容会自动存下来，能搜到这些。</li>
+                <li><b>内容补全模式</b><br/>用 QQ 自己的接口把历史卡片的内容一条条补回来。会有少量请求，速度慢一些，覆盖更全。</li>
+            </ul>
+
+            <div class="fs-actions">
+                <button class="fs-btn" data-act="content">用内容补全模式</button>
+                <button class="fs-btn fs-btn-ghost" data-act="local">先用仅本地模式</button>
+            </div>
+            <p class="fs-hint" style="margin-top:12px;font-size:11px;color:var(--fs-text-weak)">
+                随时可以在设置里改。快捷键默认 Alt + S。
+            </p>
+        </div>`;
+
+    ui.body.querySelector('[data-act="content"]').addEventListener('click', () => {
+        bridge && bridge.patchConfig({ contentMode: true, onboarded: true });
+        STATE.config.contentMode = true;
+        STATE.config.onboarded = true;
+        STATE.mode = 'search';
+        renderResultsArea();
+        ui.input.focus();
+        setTimeout(() => runCrawl(), 300);
+    });
+
+    ui.body.querySelector('[data-act="local"]').addEventListener('click', () => {
+        bridge && bridge.patchConfig({ contentMode: false, onboarded: true });
+        STATE.config.contentMode = false;
+        STATE.config.onboarded = true;
+        STATE.mode = 'search';
+        renderResultsArea();
+        ui.input.focus();
+    });
+}
+
+function renderCrawlStatus() {
+    const el = document.querySelector('.fs-foot-stat');
+    if (!el) return;
+    if (crawler.running) {
+        const total = crawler.total || 0;
+        el.textContent = crawler.paused
+            ? `已暂停（${crawler.done}/${total}）`
+            : `正在补全内容 ${crawler.done}/${total}${crawler.failed ? '（失败 ' + crawler.failed + '）' : ''}`;
+    } else if (crawler.done > 0) {
+        el.textContent = `补全完成：成功 ${crawler.done}，失败 ${crawler.failed}`;
+    } else {
+        refreshStats();
+    }
+}
+
+let _statsText = '';
+async function refreshStats() {
+    if (!bridge || !ui) return;
+    try {
+        const res = await bridge.stats();
+        if (res && res.ok) {
+            const s = res.data;
+            _statsText = `已收录 ${s.total} 张卡片 · 其中 ${s.withInner} 张有完整内容`;
+            const el = document.querySelector('.fs-foot-stat');
+            if (el && !crawler.running) el.textContent = _statsText;
+        }
+    } catch (_) {
+        /* 统计失败不影响使用 */
+    }
+}
+
+function toast(message) {
+    const el = document.querySelector('.fs-foot-stat');
+    if (el) {
+        const old = el.textContent;
+        el.textContent = message;
+        setTimeout(() => {
+            el.textContent = old || _statsText;
+        }, 2600);
+    } else {
+        log(message);
+    }
+}
+
+function openSettingsHint() {
+    toast('设置：QQ 左下角 ⚙ → 插件设置 → 合并转发搜索');
+}
+
+/* ---------- 设置页（QQ 设置面板里的那一块） ---------- */
+
+export const onSettingWindowCreated = (view) => {
+    try {
+        injectStyleOnce();
+        // 设置窗口是独立窗口，主题要重新判断一次
+        const theme = computeTheme();
+        const root = document.createElement('div');
+        root.className = 'fs-root fs-settings';
+        root.setAttribute('data-fs-theme', theme);
+        root.innerHTML = `
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    外观
+                    <span class="fs-row-desc">跟随系统：系统切成深色时，弹窗也跟着变深色。</span>
+                </div>
+                <div class="fs-seg" data-k="theme">
+                    <button type="button" data-val="system">跟随系统</button>
+                    <button type="button" data-val="light">浅色</button>
+                    <button type="button" data-val="dark">深色</button>
+                </div>
+            </div>
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    内容补全模式
+                    <span class="fs-row-desc">关闭 = 仅本地模式，完全不联网。打开后会用 QQ 自己的接口把卡片内容补全。</span>
+                </div>
+                <div class="fs-switch" data-k="contentMode"></div>
+            </div>
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    被动收录
+                    <span class="fs-row-desc">别人发来卡片、你打开卡片时顺手存下来，不额外发请求。</span>
+                </div>
+                <div class="fs-switch" data-k="passiveCapture"></div>
+            </div>
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    快捷键
+                    <span class="fs-row-desc">点一下这个按钮，然后直接按你想用的组合键（比如 Ctrl+Shift+F）。改完重启 QQ 生效。</span>
+                </div>
+                <button class="fs-btn fs-btn-ghost fs-hotkey-rec" data-k="hotkey" type="button">Alt+S</button>
+            </div>
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    悬浮按钮
+                    <span class="fs-row-desc">主面板上放一个可以拖动的圆形按钮，随时点开搜索，不依赖快捷键。</span>
+                </div>
+                <div class="fs-switch" data-k="showFloat"></div>
+            </div>
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    补全速度
+                    <span class="fs-row-desc">两次请求之间的等待时间。越大越安全，越小越快。</span>
+                </div>
+                <input class="fs-input" data-k="crawlIntervalMs" type="number" style="flex:0 0 100px;text-align:right;border:1px solid var(--fs-border);border-radius:6px;padding:4px 8px;" />
+            </div>
+            <div class="fs-row">
+                <div class="fs-row-label">
+                    本地数据
+                    <span class="fs-row-desc" data-stat>正在统计…</span>
+                    <div class="fs-progress"><i data-progress></i></div>
+                </div>
+                <button class="fs-btn fs-btn-ghost" data-act="open">打开目录</button>
+                <button class="fs-btn fs-btn-ghost" data-act="clear">清空索引</button>
+            </div>
+        `;
+        view.appendChild(root);
+
+        const refresh = async () => {
+            if (!bridge) return;
+            const cfg = await bridge.getConfig();
+            const c = cfg && cfg.ok ? cfg.data : STATE.config || {};
+            STATE.config = c;
+
+            // 设置页自己也要跟着主题走
+            root.setAttribute('data-fs-theme', computeTheme());
+
+            const seg = root.querySelector('.fs-seg[data-k="theme"]');
+            if (seg) {
+                const paint = (val) => {
+                    Array.from(seg.querySelectorAll('button')).forEach((b) => {
+                        b.classList.toggle('is-on', b.dataset.val === val);
+                    });
+                };
+                // auto 是老配置的写法，界面上统一表现成"跟随系统"
+                paint(c.theme === 'auto' ? 'system' : c.theme || 'system');
+                Array.from(seg.querySelectorAll('button')).forEach((b) => {
+                    b.addEventListener('click', () => {
+                        const val = b.dataset.val;
+                        paint(val);
+                        STATE.config.theme = val;
+                        bridge.patchConfig({ theme: val });
+                        // 立刻换，不用等 QQ 重启
+                        applyTheme();
+                    });
+                });
+            }
+
+            root.querySelectorAll('.fs-switch').forEach((sw) => {
+                sw.classList.toggle('is-on', !!c[sw.dataset.k]);
+                sw.addEventListener('click', () => {
+                    const k = sw.dataset.k;
+                    const next = !sw.classList.contains('is-on');
+                    sw.classList.toggle('is-on', next);
+                    bridge.patchConfig({ [k]: next });
+                    STATE.config[k] = next;
+                    // 悬浮按钮要立刻出现/消失，不用等重启
+                    if (k === 'showFloat') {
+                        if (next) mountFloat();
+                        else unmountFloat();
+                    }
+                });
+            });
+
+            // 快捷键录制：点一下 → 直接按组合键 → 存进去。
+            // 之所以不做成输入框，是因为手打很容易打出 "A+B" 这种无效值（真机上就这么废过一次）。
+            const hotkeyBtn = root.querySelector('[data-k="hotkey"]');
+            if (hotkeyBtn) {
+                let recording = false;
+                const show = (v) => { hotkeyBtn.textContent = v || '未设置'; };
+                show(c.hotkey || 'Alt+S');
+
+                const startRecord = () => {
+                    if (recording) return;
+                    recording = true;
+                    hotkeyBtn.classList.add('is-recording');
+                    hotkeyBtn.textContent = '请按键…（Esc 取消）';
+                    hotkeyBtn.focus();
+                };
+
+                hotkeyBtn.addEventListener('click', startRecord);
+
+                hotkeyBtn.addEventListener('keydown', (e) => {
+                    if (!recording) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    if (e.key === 'Escape') {
+                        recording = false;
+                        hotkeyBtn.classList.remove('is-recording');
+                        show(c.hotkey || 'Alt+S');
+                        hotkeyBtn.blur();
+                        return;
+                    }
+
+                    // 只按了修饰键，继续等主键
+                    if (MODIFIER_KEYS.includes(String(e.key).toLowerCase())) return;
+                    if (!e.key || e.key === 'Unidentified') return;
+
+                    const parts = [];
+                    if (e.ctrlKey) parts.push('Ctrl');
+                    if (e.altKey) parts.push('Alt');
+                    if (e.shiftKey) parts.push('Shift');
+                    if (e.metaKey) parts.push('Meta');
+
+                    const main = keyLabel(e.key);
+                    const combo = parts.concat(main).join('+');
+
+                    // 没有修饰键也允许，但要提醒一下：单独一个字母会和打字冲突
+                    recording = false;
+                    hotkeyBtn.classList.remove('is-recording');
+                    show(combo);
+                    c.hotkey = combo;
+                    STATE.config.hotkey = combo;
+                    bridge.patchConfig({ hotkey: combo });
+                    hotkeyBtn.blur();
+                    diag(`[settings] 快捷键改为 ${combo}`);
+                });
+
+                hotkeyBtn.addEventListener('blur', () => {
+                    if (!recording) return;
+                    recording = false;
+                    hotkeyBtn.classList.remove('is-recording');
+                    show(c.hotkey || 'Alt+S');
+                });
+            }
+            const speed = root.querySelector('[data-k="crawlIntervalMs"]');
+            if (speed) {
+                speed.value = c.crawlIntervalMs || 1600;
+                speed.addEventListener('change', () =>
+                    bridge.patchConfig({ crawlIntervalMs: Math.max(600, Number(speed.value) || 1600) })
+                );
+            }
+
+            const stats = await bridge.stats();
+            if (stats && stats.ok) {
+                const d = stats.data;
+                const el = root.querySelector('[data-stat]');
+                if (el) el.textContent = `已收录 ${d.total} 张卡片，${d.withInner} 张有完整内容，${d.pending} 张待补全。`;
+                const bar = root.querySelector('[data-progress]');
+                if (bar) {
+                    const pct = d.total ? Math.round((d.withInner / d.total) * 100) : 0;
+                    bar.style.width = pct + '%';
+                }
+            }
+        };
+
+        root.querySelector('[data-act="open"]').addEventListener('click', () => bridge && bridge.openDataDir());
+        root.querySelector('[data-act="clear"]').addEventListener('click', async () => {
+            if (!bridge) return;
+            const yes = confirm('确定要清空本地索引吗？这会删掉所有已收录的卡片记录（不影响 QQ 本身的消息）。');
+            if (!yes) return;
+            await bridge.clear();
+            refresh();
+        });
+
+        refresh();
+    } catch (err) {
+        console.error('[forward-search] 搭建设置页失败', err);
+    }
+};
+
+/* ---------- 快捷键 ---------- */
+
+const MODIFIER_KEYS = ['control', 'alt', 'shift', 'meta', 'os'];
+
+/** 把录制到的按键名换成人看得懂、又能存进配置的写法 */
+function keyLabel(key) {
+    const k = String(key || '');
+    if (k === ' ') return 'Space';
+    if (k.length === 1) return k.toUpperCase();
+    const map = {
+        ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right',
+        Escape: 'Esc', Backspace: 'Backspace', Delete: 'Delete', Enter: 'Enter', Tab: 'Tab',
+        Home: 'Home', End: 'End', PageUp: 'PageUp', PageDown: 'PageDown'
+    };
+    return map[k] || k;
+}
+
+/** 配置里的写法 → 浏览器 e.key 的写法，两边对得上才可能命中 */
+const KEY_ALIASES = {
+    up: 'arrowup', down: 'arrowdown', left: 'arrowleft', right: 'arrowright',
+    esc: 'escape', space: ' ', delete: 'delete', return: 'enter'
+};
+
+/**
+ * 解析 "Alt+S" 这类字符串。
+ * 关键点：解析失败要返回 disabled:true，而不是返回一个 key 为空的组合——
+ * 否则空 key 会变成"随便按什么都能触发"，在设置里打字都会弹窗（真机踩过）。
+ */
+function parseHotkey(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return { disabled: true, key: '', ctrl: false, alt: false, shift: false, meta: false };
+
+    const parts = raw.split('+').map((s) => s.trim().toLowerCase()).filter(Boolean);
+    const key = parts.pop() || '';
+
+    // 只有修饰键、没有主键 → 无效
+    if (!key || MODIFIER_KEYS.includes(key)) {
+        return { disabled: true, key: '', ctrl: false, alt: false, shift: false, meta: false };
+    }
+
+    // 形如 "A+B"（B 当主键、A 当修饰键）这种手打出来的废值也要挡住，
+    // 否则会退化成"单按 B 就触发"，等于把聊天打字全劫持了。
+    const knownMods = ['ctrl', 'control', 'alt', 'shift', 'meta', 'cmd', 'win'];
+    if (parts.some((p) => !knownMods.includes(p))) {
+        return { disabled: true, key: '', ctrl: false, alt: false, shift: false, meta: false };
+    }
+
+    return {
+        disabled: false,
+        ctrl: parts.includes('ctrl') || parts.includes('control'),
+        alt: parts.includes('alt'),
+        shift: parts.includes('shift'),
+        meta: parts.includes('meta') || parts.includes('cmd') || parts.includes('win'),
+        key: KEY_ALIASES[key] || key
+    };
+}
+
+/** 光标在输入框里时，所有全局快捷键都要让路 */
+function isTypingTarget(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el.isContentEditable) return true;
+    // QQ 自己的输入框外面常套一层可编辑容器
+    return !!(el.closest && el.closest('[contenteditable="true"], [contenteditable=""]'));
+}
+
+function setupHotkey() {
+    let combo = parseHotkey(STATE.config && STATE.config.hotkey);
+
+    document.addEventListener(
+        'keydown',
+        (e) => {
+            // Esc：关掉弹窗或返回
+            if (e.key === 'Escape' && STATE.open) {
+                if (STATE.mode === 'detail') {
+                    STATE.mode = 'search';
+                    STATE.currentCard = null;
+                    renderResultsArea();
+                } else {
+                    closePanel();
+                }
+                return;
+            }
+
+            // 在输入框里打字时不响应快捷键（否则设置里改快捷键会一边输入一边弹窗）
+            if (isTypingTarget(e.target)) return;
+
+            if (combo.disabled) return;
+
+            const keyMatched = String(e.key || '').toLowerCase() === combo.key;
+            if (!keyMatched) return;
+            if (!!e.ctrlKey !== combo.ctrl) return;
+            if (!!e.altKey !== combo.alt) return;
+            if (!!e.shiftKey !== combo.shift) return;
+            if (!!e.metaKey !== combo.meta) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            diag(`[renderer] 快捷键命中 key=${e.key} alt=${e.altKey} open=${STATE.open}`);
+            if (STATE.open) closePanel();
+            else openPanel();
+        },
+        true
+    );
+
+    if (bridge && bridge.onConfigChanged) {
+        bridge.onConfigChanged((cfg) => {
+            STATE.config = cfg;
+            combo = parseHotkey(cfg.hotkey);
+            // 主题可能在设置页被改过，这里跟着换
+            applyTheme();
+        });
+    }
+}
+
+/* ---------- 悬浮按钮（可拖动） ----------
+ * 为什么还要这个：快捷键会被别的软件占用、也可能被自己改坏，
+ * 有个看得见、点得着的按钮，才叫"随时能打开"。
+ * 位置存成比例（0~1），换窗口大小、换分辨率都不会跑到屏幕外面去。
+ */
+
+const FLOAT_SIZE = 46;
+const FLOAT_MARGIN = 8;
+
+function clamp01(v) {
+    return Math.min(1, Math.max(0, v));
+}
+
+function floatPosToPx(pos) {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const p = pos && typeof pos.x === 'number' && typeof pos.y === 'number'
+        ? pos
+        : { x: 0.972, y: 0.78 }; // 默认贴在右下，输入框上方一点
+    const maxX = Math.max(FLOAT_MARGIN, vw - FLOAT_SIZE - FLOAT_MARGIN);
+    const maxY = Math.max(FLOAT_MARGIN, vh - FLOAT_SIZE - FLOAT_MARGIN);
+    return {
+        left: Math.min(maxX, Math.max(FLOAT_MARGIN, clamp01(p.x) * vw - FLOAT_SIZE / 2)),
+        top: Math.min(maxY, Math.max(FLOAT_MARGIN, clamp01(p.y) * vh - FLOAT_SIZE / 2))
+    };
+}
+
+function unmountFloat() {
+    const el = document.querySelector('.fs-float');
+    if (el) el.remove();
+}
+
+function mountFloat() {
+    if (!isMainWindow()) return;
+    if (STATE.config && STATE.config.showFloat === false) return;
+    if (document.querySelector('.fs-float')) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'fs-root fs-float';
+    btn.setAttribute('data-fs-theme', detectThemeFromDom());
+    btn.title = `合并转发搜索（快捷键 ${(STATE.config && STATE.config.hotkey) || 'Alt+S'}）`;
+    btn.innerHTML = `
+        <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <circle cx="8.6" cy="8.6" r="5.4" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M12.8 12.8L16.6 16.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+        </svg>`;
+
+    const place = (pos) => {
+        const { left, top } = floatPosToPx(pos);
+        btn.style.left = left + 'px';
+        btn.style.top = top + 'px';
+    };
+    place(STATE.config && STATE.config.floatPos);
+
+    // 拖动 + 点击（移动超过 4px 就算拖动，不触发打开）
+    let dragging = false;
+    let moved = false;
+    let startX = 0;
+    let startY = 0;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    btn.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragging = true;
+        moved = false;
+        const r = btn.getBoundingClientRect();
+        startX = e.clientX;
+        startY = e.clientY;
+        offsetX = e.clientX - r.left;
+        offsetY = e.clientY - r.top;
+        btn.classList.add('is-dragging');
+        try {
+            btn.setPointerCapture(e.pointerId);
+        } catch (_) { /* 忽略 */ }
+    });
+
+    btn.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        if (Math.abs(e.clientX - startX) > 4 || Math.abs(e.clientY - startY) > 4) moved = true;
+        if (!moved) return;
+        const maxX = window.innerWidth - FLOAT_SIZE - FLOAT_MARGIN;
+        const maxY = window.innerHeight - FLOAT_SIZE - FLOAT_MARGIN;
+        btn.style.left = Math.min(maxX, Math.max(FLOAT_MARGIN, e.clientX - offsetX)) + 'px';
+        btn.style.top = Math.min(maxY, Math.max(FLOAT_MARGIN, e.clientY - offsetY)) + 'px';
+    });
+
+    btn.addEventListener('pointerup', (e) => {
+        if (!dragging) return;
+        dragging = false;
+        btn.classList.remove('is-dragging');
+        try {
+            btn.releasePointerCapture(e.pointerId);
+        } catch (_) { /* 忽略 */ }
+
+        if (!moved) {
+            if (STATE.open) closePanel();
+            else openPanel();
+            return;
+        }
+
+        // 松手后记住位置：存比例，下次换窗口大小也不跑偏
+        const r = btn.getBoundingClientRect();
+        const pos = {
+            x: clamp01((r.left + FLOAT_SIZE / 2) / window.innerWidth),
+            y: clamp01((r.top + FLOAT_SIZE / 2) / window.innerHeight)
+        };
+        STATE.config.floatPos = pos;
+        if (bridge) bridge.patchConfig({ floatPos: pos });
+        diag(`[float] 位置已保存 x=${pos.x.toFixed(3)} y=${pos.y.toFixed(3)}`);
+    });
+
+    document.body.appendChild(btn);
+    const fr = btn.getBoundingClientRect();
+    diag(`[float] 悬浮按钮已挂载 rect=${Math.round(fr.left)},${Math.round(fr.top)} ${Math.round(fr.width)}x${Math.round(fr.height)} vw=${window.innerWidth}`);
+}
+
+/* ---------- 入口按钮 ----------
+ * 快捷键难免会被占用或者被用户忘掉，所以主面板右上角常驻一个小按钮。
+ * 为什么用 position: fixed 挂在 body 上，而不是插进 QQ 的顶栏 DOM：
+ * QQ 是 Vue 应用，顶栏会随状态重渲染，插进去的节点随时可能被抹掉；
+ * 固定定位的节点属于我们自己的，QQ 怎么渲染都不影响它。
+ */
+
+/** 当前窗口是不是 QQ 主面板（聊天小窗、登录页、隐藏窗口都不算） */
+function isMainWindow() {
+    try {
+        if (String(location.href).indexOf('index.html') < 0) return false;
+        return !!document.querySelector('.sidebar');
+    } catch (_) {
+        return false;
+    }
+}
+
+function mountLauncher() {
+    if (!isMainWindow()) return;
+    if (document.querySelector('.fs-launcher')) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'fs-root fs-launcher';
+    // 跟 QQ 顶栏自身的深浅走，而不是弹窗设置里的主题
+    btn.setAttribute('data-fs-theme', detectThemeFromDom());
+    btn.title = `搜索合并转发卡片（快捷键 ${(STATE.config && STATE.config.hotkey) || 'Alt+S'}）`;
+    btn.innerHTML = `
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <circle cx="7" cy="7" r="4.4" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M10.4 10.4L13.4 13.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        <span>卡片搜索</span>`;
+
+    // 用 mousedown 而不是 click：QQ 顶栏有拖拽逻辑，先抢在前面把事件停掉
+    btn.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (STATE.open) closePanel();
+        else openPanel();
+    });
+
+    document.body.appendChild(btn);
+    const r = btn.getBoundingClientRect();
+    diag(`[launcher] 入口按钮已挂载 rect=${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`);
+}
+
+/* ---------- 启动 ---------- */
+
+async function bootstrap() {
+    // 同一个窗口里只装一次
+    if (window.__forwardSearchMounted) return;
+    window.__forwardSearchMounted = true;
+    diag('[renderer] bootstrap 开始');
+
+    // preload 有可能比渲染层晚一步挂上，这里再取一次
+    if (!bridge && window.forwardSearch) bridge = window.forwardSearch;
+
+    injectStyleOnce();
+    watchTheme();
+
+    // 读配置。读不到就用一份保守的默认值，保证界面还能打开。
+    try {
+        const res = bridge ? await bridge.getConfig() : null;
+        STATE.config = res && res.ok ? res.data : { hotkey: 'Alt+S', debounce: 220, maxResults: 60, contentMode: false, onboarded: false, theme: 'system' };
+    } catch (_) {
+        STATE.config = { hotkey: 'Alt+S', debounce: 220, maxResults: 60, contentMode: false, onboarded: false, theme: 'system' };
+    }
+
+    // 配置拿到了才知道该跟系统还是锁深浅，这里定一次基调
+    applyTheme();
+    diag(`[renderer] config 已读 theme=${STATE.config && STATE.config.theme} hotkey=${STATE.config && STATE.config.hotkey}`);
+
+    setupHotkey();
+    mountLauncher();
+    mountFloat();
+
+    // 窗口大小变了，按比例重新摆一次悬浮按钮（比例坐标不会跑出可见区域）
+    window.addEventListener('resize', () => {
+        const el = document.querySelector('.fs-float');
+        if (!el || !STATE.config) return;
+        const { left, top } = floatPosToPx(STATE.config.floatPos);
+        el.style.left = left + 'px';
+        el.style.top = top + 'px';
+    });
+
+    // QQ 某些操作会把 body 重渲染，按钮要是被抹掉了就补回来（3 秒一查，成本可忽略）
+    if (isMainWindow()) {
+        setInterval(() => {
+            if (!document.querySelector('.fs-launcher')) mountLauncher();
+            if (!document.querySelector('.fs-float')) mountFloat();
+        }, 3000);
+    }
+
+    // 排障开关：config.json 里把 debugAutoOpen 设为 true，启动后会自己弹一次搜索框，
+    // 方便远程排查"界面长什么样"。默认关闭，正常使用不需要动它。
+    if (STATE.config && STATE.config.debugAutoOpen && isMainWindow()) {
+        setTimeout(() => {
+            if (!STATE.open) openPanel();
+        }, 1500);
+    }
+
+    if (!bridge) {
+        console.error('[forward-search] 没有拿到桥接接口，插件功能不可用（请检查 preload 是否加载）');
+    } else {
+        log('插件已就绪，快捷键', STATE.config.hotkey);
+    }
+}
+
+// 等 QQ 自己的界面挂载完再动手，避免抢跑
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(bootstrap, 800);
+} else {
+    window.addEventListener('DOMContentLoaded', () => setTimeout(bootstrap, 800));
+}

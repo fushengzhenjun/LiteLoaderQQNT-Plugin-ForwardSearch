@@ -1,0 +1,6 @@
+# 统一换行，避免 Windows 上的 CRLF 混进仓库（CI 里跑脚本容易出问题）
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.zip binary

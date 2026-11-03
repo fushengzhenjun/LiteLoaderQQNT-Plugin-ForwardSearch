@@ -1,0 +1,51 @@
+name: Release
+
+# 打一个 tag（比如 1.0.0）就自动打包成 zip 并挂到 Release 上。
+# LiteLoader 插件市场下载的就是这个 zip，里面必须是「插件目录本身」的结构，
+# 也就是解压后能看到 manifest.json，而不是又多套一层文件夹。
+
+on:
+  push:
+    tags:
+      - '*' # 任意 tag 都会触发；想更严格可以改成 [0-9]+.[0-9]+.[0-9]+
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 检查 manifest 里的版本号和 tag 是否一致
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VER=$(node -p "require('./manifest.json').version")
+          echo "tag=$TAG manifest=$VER"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::tag ($TAG) 和 manifest.json 的 version ($VER) 不一致"
+            exit 1
+          fi
+
+      - name: 检查是否还留着 TODO 占位
+        run: |
+          if grep -r "TODO_YOUR" manifest.json LICENSE; then
+            echo "::error::manifest.json / LICENSE 里还有 TODO_YOUR 占位没填"
+            exit 1
+          fi
+
+      - name: 打包
+        run: |
+          mkdir -p dist/forward-search
+          cp -r manifest.json LICENSE README.md CHANGELOG.md src assets dist/forward-search/
+          cd dist
+          zip -r forward-search.zip forward-search
+          unzip -l forward-search.zip | head -20
+
+      - name: 上传到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/forward-search.zip
+          generate_release_notes: true

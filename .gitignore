@@ -1,0 +1,16 @@
+# 依赖
+node_modules/
+
+# 打包产物
+dist/
+*.zip
+
+# 本地调试产物
+*.log
+.llverify/
+screenshots/local/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
