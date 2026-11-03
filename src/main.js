@@ -351,6 +351,49 @@ function captureFromPayload(payload) {
     return cards.length;
 }
 
+/**
+ * 往 QQ 聊天窗口的 webContents 里投滚轮，把消息列表往上/下推 n 下。
+ *
+ * 为什么非要走主进程：QQ 9.9 的消息区是虚拟列表（`.q-scroll-view` 的 scrollHeight
+ * 固定 300000、`scrollTop` 会被立刻压回 0.x），渲染层里改 scrollTop、派发合成 wheel、
+ * 按 PageUp 全都推不动。实测只有 `webContents.sendInputEvent` 的 mouseWheel 有效——
+ * 每 8 下大约推进 960px，并且会让 QQ 继续加载更早的历史。
+ *
+ * 安全性：sendInputEvent 直接投给指定窗口的渲染进程，不移动系统光标、不发给前台窗口，
+ * 所以即使 QQ 在后台也不会误滚到别的程序上。
+ *
+ * @param {{x:number,y:number,notches:number,dir:'up'|'down'}} opts x/y 是窗口内 CSS 像素
+ */
+async function scrollChatUp(opts) {
+    const { BrowserWindow } = require('electron');
+    const wins = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed());
+    const win = wins.find((w) => String(w.webContents.getURL()).indexOf('#/main/message') >= 0);
+    if (!win) return { ok: false, reason: 'no-chat-window' };
+
+    const notches = Math.max(1, Math.min(30, Math.round(opts.notches || 12)));
+    const dir = opts.dir === 'down' ? -1 : 1;
+    const x = Math.round(opts.x || 0);
+    const y = Math.round(opts.y || 0);
+    const wc = win.webContents;
+
+    // 先把指针放到这个点上，Chromium 按它决定滚哪个容器
+    wc.sendInputEvent({ type: 'mouseMove', x, y });
+    for (let i = 0; i < notches; i++) {
+        wc.sendInputEvent({
+            type: 'mouseWheel',
+            x,
+            y,
+            deltaX: 0,
+            deltaY: 120 * dir,
+            wheelTicksX: 0,
+            wheelTicksY: -3 * dir,
+            canScroll: true
+        });
+        await new Promise((r) => setTimeout(r, 45));
+    }
+    return { ok: true, notches, dir };
+}
+
 /** 统一包一层，任何 handler 抛错都变成 { ok:false, error }，绝不把异常抛回渲染层 */
 function handle(channel, fn) {
     ipcMain.handle(`forward-search:${channel}`, async (event, ...args) => {
@@ -413,6 +456,8 @@ function setupIpc() {
     handle('lastPeer', () => lastActivePeer);
     handle('pending', (limit, filter) => store.pending(limit || 100, filter || {}));
     handle('setInner', (id, inner, state) => store.setInner(id, inner, state));
+    // 真滚轮：插件"替你往上翻"的唯一可行方式，详见 scrollChatUp 的注释
+    handle('scrollChatUp', (opts) => scrollChatUp(opts || {}));
     handle('compact', () => store.compact());
     handle('clear', () => {
         store.clear();

@@ -307,6 +307,8 @@ const api = {
     lastPeer: () => ipcRenderer.invoke('forward-search:lastPeer'),
     pending: (limit, filter) => ipcRenderer.invoke('forward-search:pending', limit, filter),
     setInner: (id, inner, state) => ipcRenderer.invoke('forward-search:setInner', id, inner, state),
+    /** 让主进程发滚轮，把聊天往上翻（QQ 的虚拟列表只认真实输入） */
+    scrollChatUp: (opts) => ipcRenderer.invoke('forward-search:scrollChatUp', opts),
     compact: () => ipcRenderer.invoke('forward-search:compact'),
     clear: () => ipcRenderer.invoke('forward-search:clear'),
     openDataDir: () => ipcRenderer.invoke('forward-search:openDataDir'),

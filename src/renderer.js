@@ -1272,25 +1272,263 @@ function splitPreview(preview) {
         });
 }
 
+/* ==================================================================
+ * 直达通道：借 QQ 自己的 AIO 接口，一步跳到那条消息
+ * ==================================================================
+ * 老办法是"替你往上滚轮翻页"：一张十小时前的卡片要翻几十屏，根本没法用。
+ *
+ * 真机上挖到了 QQ 前端自己的跳转入口（9.9.31 验证通过）：
+ *
+ *   `.chat-msg-area.__VUE__`     QQ 把当前挂载的 Vue 组件实例挂在这个数组上，
+ *                                顺着实例的 parent 往上走，能拿到 AIO 面板的 ctx
+ *   ctx.aioStore.setData(peer)   切换会话，不需要这个会话出现在左侧列表里
+ *   ctx.msgAction.jumpToAioMessage({ action: { payload: {
+ *       msgId, msgSeq, msgClientSeq, msgTime } } })
+ *                                一步定位到那条消息，缺的历史由 QQ 自己加载
+ *
+ * 这条路不模拟滚轮、不要用户手动翻，点到哪条就到哪条。
+ * 任何一环拿不到（QQ 改结构 / 消息已删除），自动退回老的滚轮方案。
+ */
+
+/** 拿 AIO 面板的组件上下文；拿不到返回 null */
+function aioCtx() {
+    const host = document.querySelector('.chat-msg-area');
+    const insts = host && host.__VUE__;
+    if (!insts || !insts.length) return null;
+
+    for (let i = 0; i < insts.length; i++) {
+        let inst = insts[i];
+        let guard = 0;
+        while (inst && guard++ < 24) {
+            const ctx = inst.ctx;
+            if (ctx && ctx.$MsgList && ctx.msgAction) return ctx;
+            inst = inst.parent;
+        }
+    }
+    return null;
+}
+
+/** 轮询等到条件成立，超时返回最后一次的结果 */
+async function waitFor(fn, timeout = 2000, step = 90) {
+    const end = Date.now() + timeout;
+    while (Date.now() < end) {
+        try {
+            const v = fn();
+            if (v) return v;
+        } catch (_) {
+            /* 组件树中途变化会抛错，忽略继续等 */
+        }
+        await sleep(step);
+    }
+    try {
+        return fn() || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+/** 当前 AIO 里打开的会话 uid */
+function currentAioUid(ctx) {
+    const c = ctx || aioCtx();
+    if (!c || !c.curAioData || !c.curAioData.header) return '';
+    return String(c.curAioData.header.uid || '');
+}
+
 /**
- * 尝试把用户带到这张卡片"本身"——不只是切到那个群，还要在聊天记录里
- * 把这条卡片滚到眼前、圈出来。
- *
- * 为什么非要做到这一步：合并转发卡片里的图片、文件、表情，QQ 只在自己
- * 的界面里渲染，插件拿不到（9.9.31 的 getMultiMsg 会被服务端拒）。
- * 与其让用户在详情页里对着一行"[图片]"发呆，不如直接把他送回原位置。
- *
- * 分三步，任何一步失败都降级，不抛异常：
- *   1. 切会话（优先点左侧会话列表，失败再调内核接口）
- *   2. 先看当前这一屏有没有它（有就直接圈出来）
- *   3. 没有的话挂个观察者：用户往上翻，卡片一进视野立刻圈住
- *
- * 为什么不让插件自己翻：QQ 9.9 的消息区是虚拟列表，只认真实滚轮，
- * 脚本改 scrollTop / 派发 wheel 都不动（真机实测）。所以只能"陪用户翻"。
+ * QQ 刚启动、还没点过任何会话时，右侧是"选个会话"的空页面，
+ * `.aio` 容器是 display:none。这时候只改 store 数据界面上什么都看不到，
+ * 所以先把它顶开。等用户之后点别的会话，QQ 自己会把状态纠正回来。
+ */
+function ensureAioVisible() {
+    const aio = document.querySelector('.aio');
+    if (!aio) return false;
+    if (getComputedStyle(aio).display !== 'none') return false;
+
+    try {
+        aio.style.display = 'flex';
+        const empty = document.querySelector('.empty-panel');
+        if (empty) empty.style.display = 'none';
+        diag('[jump] 聊天区原本是隐藏的，先顶开');
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * 用 QQ 自己的 aioStore 切会话。
+ * 比点击会话列表更硬：目标会话不在"最近聊天"里也能切过去。
+ */
+async function switchPeerByStore(card) {
+    const ctx = aioCtx();
+    if (!ctx || !ctx.aioStore || typeof ctx.aioStore.setData !== 'function') return false;
+
+    const peerUid = String(card.peerUid || '');
+    if (!peerUid) return false;
+
+    try {
+        const p = ctx.aioStore.setData({
+            peerUid,
+            chatType: Number(card.chatType) || 1,
+            independent: 0,
+            showMiniDetail: false,
+            peerName: card.peerName || '',
+            uin: String(card.peerUin || peerUid),
+            memberName: null,
+            unreadCnt: '0',
+            remark: '',
+            appid: ''
+        });
+        if (p && p.then) await p;
+    } catch (err) {
+        diag(`[jump] aioStore.setData 失败 ${err}`);
+        return false;
+    }
+
+    return !!(await waitFor(() => currentAioUid() === peerUid, 2600));
+}
+
+/**
+ * 直达：切会话 + 定位到那条消息。
+ * @returns {Promise<boolean>} true 表示已经站在卡片上（已高亮）
+ */
+async function directJumpToCard(card) {
+    if (!card || !card.msgId) return false;
+
+    const ctx = aioCtx();
+    if (!ctx) {
+        diag('[jump] 拿不到 AIO 上下文，走老路');
+        return false;
+    }
+
+    const peerUid = String(card.peerUid || '');
+
+    // 1) 切会话：先点列表（用户能看到选中态），点不到再动 store
+    if (peerUid && currentAioUid(ctx) !== peerUid) {
+        let ok = false;
+        if (clickChatInUi(card)) {
+            ok = !!(await waitFor(() => currentAioUid() === peerUid, 1500));
+        }
+        if (!ok) ok = await switchPeerByStore(card);
+        if (!ok) {
+            diag(`[jump] 切会话失败 peer=${peerUid}`);
+            return false;
+        }
+    }
+
+    // 2) 界面得先真的把聊天区显示出来，否则后面滚/定位都是对着 display:none 做无用功
+    if (ensureAioVisible()) await sleep(350);
+
+    // 3) 等首屏消息就绪，否则 jump 会扑空
+    await waitFor(() => {
+        const c = aioCtx();
+        return c && c.$MsgList && c.$MsgList.msgs && c.$MsgList.msgs.length > 0;
+    }, 2400);
+
+    const live = aioCtx();
+    if (!live || !live.msgAction || typeof live.msgAction.jumpToAioMessage !== 'function') {
+        diag('[jump] 没有 jumpToAioMessage');
+        return false;
+    }
+
+    const payload = {
+        msgId: String(card.msgId),
+        msgSeq: String(card.msgSeq || '0'),
+        msgClientSeq: '0',
+        msgTime: String(card.msgTime || 0)
+    };
+
+    // 3) 向 QQ 要一次真实消息：记录里的 seq/time 是采集时的快照，可能对不上
+    try {
+        const peer = { chatType: Number(card.chatType) || 1, peerUid, guildId: '' };
+        const res = await Promise.race([
+            live.msgApis.getMsgs({ peer, msgId: payload.msgId, queryOrder: true }),
+            sleep(2500).then(() => null)
+        ]);
+        const list = res && (res.msgList || (Array.isArray(res) ? res : null));
+        if (list && list.length) {
+            const hit = list.find((m) => String(m.msgId) === payload.msgId);
+            if (hit) {
+                payload.msgSeq = String(hit.msgSeq || payload.msgSeq);
+                payload.msgTime = String(hit.msgTime || payload.msgTime);
+                payload.msgClientSeq = String(hit.clientSeq || '0');
+            }
+        }
+    } catch (err) {
+        diag(`[jump] 取真实消息失败，用记录里的 seq/time：${err}`);
+    }
+
+    // 4) 让 QQ 自己跳
+    try {
+        const p = live.msgAction.jumpToAioMessage({ action: { payload } });
+        if (p && p.then) await p;
+        diag(`[jump] jumpToAioMessage id=${payload.msgId} seq=${payload.msgSeq}`);
+    } catch (err) {
+        diag(`[jump] jumpToAioMessage 抛错 ${err}`);
+    }
+
+    let node = await waitFor(() => findCardNode(card), 3000);
+
+    // 5) 兜底：消息已经在列表里但没滚到，直接让列表滚
+    if (!node) {
+        const c2 = aioCtx();
+        try {
+            if (c2 && c2.$MsgList && typeof c2.$MsgList.scrollToMsg === 'function') {
+                const p = c2.$MsgList.scrollToMsg({ id: payload.msgId });
+                if (p && p.then) await p;
+                diag('[jump] 改用 $MsgList.scrollToMsg');
+            }
+        } catch (err) {
+            diag(`[jump] scrollToMsg 抛错 ${err}`);
+        }
+        node = await waitFor(() => findCardNode(card), 2600);
+    }
+
+    if (!node) {
+        diag('[jump] 直达后 DOM 里仍没有这条消息');
+        return false;
+    }
+
+    // 虚拟列表刚把节点插进来时还没排版（宽高都是 0），这时候画圈会画在左上角。
+    // 等它真正有尺寸再圈，通常只差一两帧。
+    node = (await waitFor(() => {
+        const el = findCardNode(card);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 ? el : null;
+    }, 1800)) || node;
+
+    highlightLocated(node);
+    diag('[jump] 直达成功');
+    return true;
+}
+
+/**
+ * 把用户送到这张卡片"本身"。
+ * 先走直达通道，失败再退回老的滚轮翻页。
  */
 async function tryJumpToChat(card, opts) {
     const autoClose = !(opts && opts.keepPanel);
     jumpNotice = '';
+
+    // 直达通道可用时，成败就是定论：要么站到卡片上，要么这条消息真的没了。
+    // 不再退回滚轮——"消息不在了"这种情况，翻几十屏也翻不出来。
+    if (aioCtx()) {
+        if (await directJumpToCard(card)) {
+            if (autoClose) setTimeout(() => closePanel(), 260);
+            showWatchBar('已传送到这张卡片（蓝圈标出，往上一点就是它）', 'hit');
+            hideWatchBar(4200);
+            return true;
+        }
+        // 没传送到，就别把详情页也收走——用户至少还能看内容
+        jumpNotice = '聊天记录里找不到这条消息了，可能已被撤回或删除。下面是这张卡片能读到的内容。';
+        renderDetail();
+        showWatchBar('聊天记录里找不到这条消息了，可能已被撤回或删除', 'miss');
+        hideWatchBar(8000);
+        return false;
+    }
+
+    // —— 以下是老路：只有 QQ 改版、直达接口拿不到时才会走到 ——
 
     // 1. 切会话。点列表是最可靠的方式（内核接口只激活、不切界面）。
     let switched = clickChatInUi(card);
@@ -1307,7 +1545,7 @@ async function tryJumpToChat(card, opts) {
 
     // 2. 等界面把消息渲染出来，先看这一屏有没有
     await sleep(800);
-    const node = locateCardInView(card);
+    let node = locateCardInView(card);
 
     if (node) {
         jumpNotice = '';
@@ -1317,8 +1555,23 @@ async function tryJumpToChat(card, opts) {
         return true;
     }
 
-    // 3. 这一屏没有：收起弹窗（不然遮罩挡住滚轮），但留一条状态条说明在等什么。
-    //    之前这里是"直接关掉 + 转瞬即逝的提示"，看起来像插件崩了，改成常驻状态条。
+    // 3. 不在这一屏：先收起弹窗（遮罩会挡滚轮），然后让主进程替你往上翻。
+    //    这是唯一能真正把人送到卡片的方式——QQ 的列表只认真实滚轮。
+    if (autoClose) closePanel();
+    showWatchBar(`正在替你往上翻「${card.peerName || '聊天'}」，找到就圈出来…`);
+    node = await autoScrollToCard(card, {
+        budget: 25000,
+        onProgress: (n) => showWatchBar(`正在往上翻「${card.peerName || '聊天'}」… 第 ${n} 屏`)
+    });
+
+    if (node) {
+        highlightLocated(node);
+        showWatchBar('已定位到这张卡片（蓝圈），往上一点就是它', 'hit');
+        hideWatchBar(5000);
+        return true;
+    }
+
+    // 4. 翻不动（不是前台 / 已经到顶 / 卡片太旧没加载）：退回"陪用户翻"，并且说清原因。
     const watching = watchCardInChat(card, {
         open: false,
         onHit: () => {
@@ -1331,10 +1584,8 @@ async function tryJumpToChat(card, opts) {
         }
     });
 
-    if (autoClose) closePanel();
-
     if (watching) {
-        showWatchBar(`正在盯着「${card.peerName || '聊天'}」· 往上翻到这张卡片，我会立刻圈出来`);
+        showWatchBar(`没能自动翻到，继续盯着「${card.peerName || '聊天'}」· 你往上翻，看到就圈出来`);
     } else {
         showWatchBar(`已切到「${card.peerName || '聊天'}」，但没能开始盯梢，往上翻翻看`, 'miss');
         hideWatchBar(6000);
@@ -1447,6 +1698,22 @@ function chatRoot() {
     return best ? best.el : null;
 }
 
+/**
+ * 真正的滚动容器。
+ *
+ * `.chat-msg-area` 只是外壳，里面 `.q-scroll-view`（id=ml-root）才是 QQ 的滚动层：
+ * 它的 scrollHeight 固定 300000、scrollTop 会被 QQ 立刻压回 0.x，
+ * 所以 `scrollTop=` 这条路不通，只能靠真实滚轮（由主进程代发）。
+ */
+function chatScroller() {
+    return (
+        document.querySelector('.chat-msg-area .q-scroll-view') ||
+        document.querySelector('#ml-root') ||
+        document.querySelector('.q-scroll-view') ||
+        chatRoot()
+    );
+}
+
 /** 从卡片里挑出几段"足够独特"的原文，用来在聊天里认出它 */
 function locateNeedles(card) {
     const out = [];
@@ -1502,13 +1769,41 @@ function searchCardIn(scroller, card, needles) {
     return best ? { el: best, score: bestScore } : null;
 }
 
-/** 在"当前这一屏"里定位。找得到就圈出来，找不到返回 null（不硬滚） */
+/**
+ * 按消息 id 精确找卡片。
+ *
+ * 真机上每条消息渲染出来的 DOM id 就是它的 msgId（`.ml-item#7703832830172393598`），
+ * 所以只要它被渲染出来，就能一次命中——比按文字模糊匹配可靠得多。
+ */
+function findCardNode(card) {
+    if (!card || !card.msgId) return null;
+    const root = chatRoot();
+    const node = document.getElementById(String(card.msgId));
+    if (node && root && root.contains(node)) return node;
+    return null;
+}
+
+/** 在"当前这一屏"里定位。找得到就圈出来，找不到返回 null */
 function locateCardInView(card) {
     const root = chatRoot();
     if (!root) {
         diag('[locate] 没有聊天区');
         return null;
     }
+
+    // 先按 msgId 精确找，找不到再退回文字匹配（兼容别的 QQ 版本）
+    const exact = findCardNode(card);
+    if (exact) {
+        if (exact.scrollIntoView) {
+            try {
+                exact.scrollIntoView({ block: 'center' });
+            } catch (_) { /* 忽略 */ }
+        }
+        highlightLocated(exact);
+        diag('[locate] 按 msgId 命中');
+        return exact;
+    }
+
     const hit = searchCardIn(root, card, locateNeedles(card));
     if (!hit) {
         diag('[locate] 当前这一屏没有匹配');
@@ -1516,8 +1811,119 @@ function locateCardInView(card) {
     }
     if (hit.el.scrollIntoView) hit.el.scrollIntoView({ block: 'center' });
     highlightLocated(hit.el);
-    diag(`[locate] 命中 score=${hit.score} class=${String(hit.el.className).slice(0, 40)}`);
+    diag(`[locate] 文字命中 score=${hit.score} class=${String(hit.el.className).slice(0, 40)}`);
     return hit.el;
+}
+
+/**
+ * 把卡片滚到可视区中间。
+ * QQ 自己管滚动，所以只能继续投小批量滚轮，一点点挪。
+ */
+async function centerCard(node, sc) {
+    const pos = {
+        x: Math.round(sc.getBoundingClientRect().left + sc.getBoundingClientRect().width / 2),
+        y: Math.round(sc.getBoundingClientRect().top + sc.getBoundingClientRect().height / 2)
+    };
+    for (let i = 0; i < 6; i++) {
+        const cur = findCardNode({ msgId: node.id });
+        if (!cur) return null;
+        const r = cur.getBoundingClientRect();
+        const a = sc.getBoundingClientRect();
+        if (r.top >= a.top + 6 && r.bottom <= a.bottom - 6) return cur;
+        const dir = r.top < a.top ? 'up' : 'down';
+        const res = await bridge.scrollChatUp(Object.assign({ notches: 2, dir }, pos));
+        if (!res || !res.ok || !res.data || !res.data.ok) return cur;
+        await sleep(380);
+    }
+    return findCardNode({ msgId: node.id });
+}
+
+/**
+ * 替用户往上翻，直到那张卡片被 QQ 渲染出来。这是"真正把人送到卡片"的唯一办法：
+ * QQ 的消息区只认真实滚轮，所以由主进程往它的 webContents 里投滚轮，每翻一批用
+ * msgId 精确查一次，命中就停下来并把它挪到可视区中间。
+ *
+ * @param {object} card
+ * @param {{budget?:number, onProgress?:(round:number)=>void}} opts
+ * @returns {Promise<Element|null>}
+ */
+async function autoScrollToCard(card, opts) {
+    if (!card || !card.msgId) return null;
+    if (!bridge || !bridge.scrollChatUp) return null;
+
+    const sc = chatScroller();
+    if (!sc) return null;
+    const rect0 = sc.getBoundingClientRect();
+    if (rect0.width < 120 || rect0.height < 80) return null;
+
+    const pos = {
+        x: Math.round(rect0.left + rect0.width / 2),
+        y: Math.round(rect0.top + rect0.height / 2)
+    };
+    // 进度只能看"内容有没有换"：QQ 每加载完一页会把 scrollTop 重置回 0，
+    // 所以滚动偏移不能当进度用，必须看首条消息的 id 和它的位置。
+    const marker = () => {
+        const first = document.querySelector('.ml-list > *');
+        if (!first) return '';
+        return first.id + '|' + Math.round(first.getBoundingClientRect().top);
+    };
+
+    const budget = (opts && opts.budget) || 35000;
+    const onProgress = (opts && opts.onProgress) || null;
+    const deadline = Date.now() + budget;
+    let lastMove = Date.now();
+    let lastMark = '';
+    let round = 0;
+
+    while (Date.now() < deadline && round < 70) {
+        round++;
+
+        const node = findCardNode(card);
+        if (node) {
+            diag(`[scroll] 第 ${round} 轮命中`);
+            return (await centerCard(node, sc)) || node;
+        }
+
+        const before = marker();
+        if (before !== lastMark) {
+            lastMark = before;
+            lastMove = Date.now();
+        }
+        const res = await bridge.scrollChatUp(Object.assign({ notches: 8 }, pos));
+        const inner = res && res.data;
+        if (!res || !res.ok || !inner || !inner.ok) {
+            diag('[scroll] 主进程没滚：' + JSON.stringify((inner && inner.reason) || (res && res.error) || 'unknown'));
+            return null;
+        }
+        await sleep(800);
+
+        const hit = findCardNode(card);
+        if (hit) {
+            diag(`[scroll] 第 ${round} 轮命中`);
+            return (await centerCard(hit, sc)) || hit;
+        }
+
+        // 内容一直在变就继续翻；连续 3.5 秒没有任何变化，才算真的到顶
+        const after = marker();
+        if (after !== lastMark) {
+            lastMark = after;
+            lastMove = Date.now();
+        }
+        if (round % 5 === 0) diag(`[scroll] 第 ${round} 轮 ${after}`);
+        if (Date.now() - lastMove > 4000) {
+            diag('[scroll] 4 秒没有新内容，判定到顶');
+            return null;
+        }
+
+        if (onProgress) {
+            try {
+                onProgress(round);
+            } catch (_) { /* 忽略 */ }
+        }
+    }
+
+    diag(`[scroll] 翻了 ${round} 轮仍未命中`);
+    return null;
 }
 
 /* ------------------------------------------------------------------
@@ -1547,7 +1953,7 @@ function stopCardWatch() {
 function watchCardInChat(card, opts) {
     stopCardWatch();
     const needles = locateNeedles(card);
-    if (!needles.length) return false;
+    if (!needles.length && !card.msgId) return false;
     if (!chatRoot()) return false;
 
     const openAfter = !!(opts && opts.open);
@@ -1561,14 +1967,20 @@ function watchCardInChat(card, opts) {
         try {
             const root = chatRoot();
             if (!root) return;
-            const hit = searchCardIn(root, card, needles);
-            if (!hit) return;
+
+            // 先按 msgId 精确找（QQ 把 msgId 直接写成 DOM id），没有再退回文字匹配
+            let el = findCardNode(card);
+            if (!el) {
+                const hit = searchCardIn(root, card, needles);
+                if (!hit) return;
+                el = hit.el;
+            }
 
             stop();
-            highlightLocated(hit.el);
-            if (typeof onHit === 'function') onHit(hit.el);
+            highlightLocated(el);
+            if (typeof onHit === 'function') onHit(el);
             else showFloatingToast(openAfter ? '找到了，正在打开原卡片…' : '找到了，就是这张');
-            if (openAfter) setTimeout(() => clickCardNode(hit.el), 400);
+            if (openAfter) setTimeout(() => clickCardNode(el), 400);
             diag('[locate] 观察者命中');
         } catch (err) {
             diag('[locate] tick 异常 ' + err);
@@ -1760,7 +2172,32 @@ function hideWatchBar(delay) {
  * 如果卡片不在当前这一屏，就挂着观察者，等用户滚到那儿自动点开。
  */
 async function openOriginalCard(card) {
-    const el = locateCardInView(card);
+    let el = locateCardInView(card);
+
+    // 不在这一屏：先走直达通道（一步跳过去），跳到了再点开
+    if (!el && card) {
+        const canDirect = !!aioCtx();
+        if (canDirect && (await directJumpToCard(card))) {
+            el = locateCardInView(card);
+        } else if (canDirect) {
+            closePanel();
+            showWatchBar('聊天记录里找不到这条消息了，可能已被撤回或删除', 'miss');
+            hideWatchBar(8000);
+            return false;
+        }
+    }
+
+    // 直达接口拿不到（QQ 改版）才退回老办法：往上翻，翻到了再点开
+    if (!el) {
+        if (card && card.peerName) closePanel();
+        showWatchBar('正在传送，找到后自动打开原卡片…');
+        el = await autoScrollToCard(card, {
+            budget: 25000,
+            onProgress: (n) => showWatchBar(`正在往上翻… 第 ${n} 屏，找到就替你打开`)
+        });
+        if (el) highlightLocated(el);
+    }
+
     if (el) {
         await sleep(400);
         clickCardNode(el);
