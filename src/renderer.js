@@ -346,6 +346,12 @@ async function callKernelAny(tries, budgetMs = 11000) {
         if (!res) continue;
         const msgs = collectMessages(res, [], 0);
         if (msgs.length > 0) return { res, msgs };
+        // 返回了但没解析出消息：把原始形状记下来，不然只能瞎猜
+        try {
+            diag(`[kernel] ${t.cmdName} 有返回但无消息：${JSON.stringify(res).slice(0, 400)}`);
+        } catch (_) {
+            /* 序列化失败就算了 */
+        }
     }
     return null;
 }
@@ -368,30 +374,41 @@ function peerOf(card) {
  */
 async function fetchCardInner(card, budgetMs = 11000) {
     if (!card || !card.msgId) return null;
+    const start = Date.now();
     const peer = peerOf(card);
+    const resid = card.resid || '';
 
     const tries = [
-        // 写法一：对象参数 + 等同 callbackId 的回复
-        { cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [{ peer, msgId: card.msgId }, null], awaitMode: true },
-        // 写法二：位置参数
-        { cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [peer, card.msgId, null], awaitMode: true },
-        // 写法三：有些版本合并转发内容会挂在消息列表更新事件里
-        {
-            cmdName: 'nodeIKernelMsgService/getMultiMsg',
-            payload: [{ peer, msgId: card.msgId }, null],
-            awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate', 'nodeIKernelMsgListener/onMsgRecordChange']
-        },
-        // 写法四：退而求其次，只要拿回这条外层消息，它可能自带 records
-        { cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf', payload: [peer, card.msgId, 1, true], awaitMode: true },
-        {
-            cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf',
-            payload: [{ peer, msgId: card.msgId, cnt: 1, queryOrder: true }, null],
-            awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate']
-        }
+        // 卡片里带着 resid，很多版本服务端要的是它，不是外层消息 ID
+        { label: 'getMultiMsg resid', cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [{ peer, msgId: resid }, null], awaitMode: true },
+        { label: 'getMultiMsg resid 位置参数', cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [peer, resid, null], awaitMode: true },
+        { label: 'getMultiMsg msgId', cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [{ peer, msgId: card.msgId }, null], awaitMode: true },
+        { label: 'getMultiMsg msgId 位置参数', cmdName: 'nodeIKernelMsgService/getMultiMsg', payload: [peer, card.msgId, null], awaitMode: true },
+        // 退而求其次：只把外层消息拿回来，它可能自带 records
+        { label: 'IncludeSelf 外层消息', cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf', payload: [{ peer, msgId: card.msgId, cnt: 1, queryOrder: true }, null], awaitMode: true }
     ];
 
-    const hit = await callKernelAny(tries, budgetMs);
-    if (!hit) return null;
+    let hitMsgs = null;
+    for (let i = 0; i < tries.length; i++) {
+        const t = tries[i];
+        if (Date.now() - start > budgetMs) break;
+        const res = await callKernel(t.cmdName, t.payload, t.awaitMode);
+        const msgs = res ? collectMessages(res, [], 0) : [];
+        diag(`[inner] ${i + 1}.${t.label} → ${res ? res.__statue || 'ok' : 'null'} / ${msgs.length} 条`);
+        if (msgs.length > 0) {
+            hitMsgs = msgs;
+            break;
+        }
+    }
+    if (!hitMsgs) return null;
+
+    // 只拿回"卡片自己"不算拿到内容：它里面还是那张卡，没有内部消息
+    if (hitMsgs.length === 1 && (hitMsgs[0].elements || []).some((el) => el && el.multiForwardMsgElement)) {
+        diag('[inner] 只拿回卡片本身，判定为失败');
+        return null;
+    }
+
+    const hit = { msgs: hitMsgs };
 
     // 从返回的消息里，把真正属于"卡片内部"的内容挑出来
     const record = requireRecordParser();
@@ -446,6 +463,50 @@ function requireRecordParser() {
             const n = Number(value);
             if (!Number.isFinite(n) || n <= 0) return 0;
             return n > 1e11 ? Math.floor(n / 1000) : Math.floor(n);
+        },
+        /**
+         * 9.9.31 的合并转发卡片：elementType=16 的 multiForwardMsgElement，
+         * xmlContent 里存的是 XML。规则与 core/record.js 里那份保持一致
+         * （沙箱里 require 不到本地模块，这里只能各存一份，改的时候两边都要动）。
+         */
+        parseMultiForwardElement(el) {
+            if (!el || typeof el !== 'object' || !el.multiForwardMsgElement) return null;
+            const node = el.multiForwardMsgElement;
+            const xml = typeof node.xmlContent === 'string' ? node.xmlContent : '';
+            if (!xml) return null;
+            if (xml.indexOf('viewMultiMsg') === -1 && xml.indexOf('m_resid') === -1) return null;
+
+            const unescape = (t) =>
+                String(t || '')
+                    .replace(/&lt;/g, '<')
+                    .replace(/&gt;/g, '>')
+                    .replace(/&quot;/g, '"')
+                    .replace(/&#39;/g, "'")
+                    .replace(/&amp;/g, '&');
+
+            const attr = (name) => {
+                const m = xml.match(new RegExp(`${name}="([^"]*)"`));
+                return m ? m[1] : '';
+            };
+
+            const titles = [];
+            const re = /<title[^>]*>([\s\S]*?)<\/title>/g;
+            let m;
+            while ((m = re.exec(xml)) !== null) titles.push(unescape(m[1].trim()));
+
+            const sum = xml.match(/<summary[^>]*>([\s\S]*?)<\/summary>/);
+            const summary = sum ? unescape(sum[1].trim()) : '';
+            const source = xml.match(/<source[^>]*name="([^"]*)"/);
+            const countMatch = summary.match(/(\d+)\s*条/);
+
+            return {
+                title: String(titles[0] || '聊天记录').slice(0, 60),
+                preview: String(titles.slice(1).join(' / ') || (source ? unescape(source[1]) : '')).slice(0, 300),
+                summary: summary.slice(0, 120),
+                resid: String(node.resId || attr('m_resid') || ''),
+                fileName: String(node.fileName || attr('m_fileName') || ''),
+                count: (countMatch ? parseInt(countMatch[1], 10) : 0) || parseInt(attr('tSum'), 10) || 0
+            };
         },
         parseInnerRecords(records) {
             if (!Array.isArray(records)) return [];
@@ -579,11 +640,22 @@ async function runCrawl() {
 }
 
 /**
- * 历史扫描：把某个会话的历史消息过一遍，把里面的合并转发卡片都收进来。
- * 注意：这一步请求量比较大，所以只在用户主动点"扫描历史"时执行。
+ * 历史扫描：把会话的历史消息过一遍，把里面的合并转发卡片都收进来。
+ *
+ * 真机摸出来的两条硬规则（9.9.31）：
+ *   1. 只有"QQ 本地缓存过"的会话才有消息 —— 也就是你打开过的那些聊天。
+ *      没打开过的会话一律返回空列表，不是接口坏了，是本地确实没有。
+ *   2. 取消息要用"对象参数 + 同 callbackId 应答"这种写法：
+ *      `[{ peer, msgId, cnt, queryOrder }, null]`。
+ *      位置参数（peer, msgId, cnt, queryOrder）会被直接拒掉（promiseStatue=fail），
+ *      等 onMsgInfoListUpdate 事件则永远等不到。
  */
 async function scanHistory(limitPerPeer = 200) {
     if (!bridge) return;
+    if (!bridge.nativeCall) {
+        toast('桥接层不支持直接调用，无法扫描');
+        return;
+    }
     if (!STATE.config || !STATE.config.contentMode) {
         toast('扫描历史需要先打开内容补全模式');
         return;
@@ -603,50 +675,76 @@ async function scanHistory(limitPerPeer = 200) {
             return;
         }
 
-        const interval = Math.max(800, Number(STATE.config.crawlIntervalMs) || 1600);
+        // 当前打开的会话排最前：它的消息一定在本地缓存里，能立刻出结果
+        let active = null;
+        try {
+            const r = bridge.lastPeer ? await bridge.lastPeer() : null;
+            active = r && r.ok ? r.data : r;
+        } catch (_) {
+            active = null;
+        }
+        const ordered = [];
+        if (active && active.peerUid) ordered.push(active);
+        for (const p of peers) {
+            if (active && p.peerUid === active.peerUid) continue;
+            ordered.push(p);
+        }
 
-        for (const peer of peers) {
+        diag(`[scan] 开始，会话 ${ordered.length} 个，最近活跃=${active ? active.peerUid : '未知'}`);
+
+        const interval = Math.max(400, Number(STATE.config.crawlIntervalMs) || 1600);
+        let cachedPeers = 0;
+
+        for (const peer of ordered) {
             if (crawler._stop) break;
             let anchor = '0';
             let fetched = 0;
+            let page = 0;
+            let peerCards = 0;
 
             while (fetched < limitPerPeer && !crawler._stop) {
-                const hit = await callKernelAny([
-                    {
-                        cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf',
-                        payload: [peer, anchor, 20, true],
-                        awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate']
-                    },
-                    {
-                        cmdName: 'nodeIKernelMsgService/getMsgsIncludeSelf',
-                        payload: [{ peer, msgId: anchor, cnt: 20, queryOrder: true }, null],
-                        awaitMode: ['nodeIKernelMsgListener/onMsgInfoListUpdate']
-                    }
-                ]);
+                const res = await bridge.nativeCall(
+                    'nodeIKernelMsgService/getMsgsIncludeSelf',
+                    [{ peer, msgId: anchor, cnt: 20, queryOrder: true }, null],
+                    true,
+                    4000
+                );
+                const msgs = res ? collectMessages(res, [], 0) : [];
 
-                if (!hit || hit.msgs.length === 0) break;
+                page++;
+                if (msgs.length === 0) break;
 
                 const cards = [];
-                for (const msg of hit.msgs) {
+                for (const msg of msgs) {
                     const card = toCard(msg, peer);
                     if (card) cards.push(card);
                 }
                 if (cards.length > 0) await bridge.upsert(cards);
 
-                fetched += hit.msgs.length;
+                peerCards += cards.length;
+                fetched += msgs.length;
                 crawler.done += cards.length;
                 renderCrawlStatus();
 
-                // 下一页的锚点：这一页最早的那条
-                const sorted = hit.msgs
-                    .map((m) => String(m.msgId || ''))
-                    .filter(Boolean);
-                const nextAnchor = sorted[sorted.length - 1];
+                // 下一页的锚点：这一页最后一条
+                const ids = msgs.map((m) => String(m.msgId || '')).filter(Boolean);
+                const nextAnchor = ids[ids.length - 1];
                 if (!nextAnchor || nextAnchor === anchor) break;
                 anchor = nextAnchor;
 
                 await sleep(interval);
             }
+
+            if (fetched > 0) {
+                cachedPeers++;
+                diag(`[scan] ${peer.name || peer.peerUid} 读到 ${fetched} 条，卡片 ${peerCards} 张`);
+            }
+        }
+
+        diag(`[scan] 结束：有缓存的会话 ${cachedPeers} 个，共收录 ${crawler.done} 张卡片`);
+
+        if (crawler.done === 0) {
+            toast(cachedPeers > 0 ? '这些会话里没有合并转发卡片' : '本地没有缓存消息，先打开几个群再扫描');
         }
     } finally {
         crawler.running = false;
@@ -655,24 +753,48 @@ async function scanHistory(limitPerPeer = 200) {
     }
 }
 
-/** 取会话列表（最近联系人），用来知道"有哪些群/好友可以扫" */
+/** 取会话列表：优先用旁听到的缓存，缓存为空才去问 QQ */
 async function listPeers() {
+    // QQ 启动时会把最近联系人和群列表推一遍，主进程顺手存了下来。
+    // 这条路不需要额外请求，也不依赖接口名（9.9.31 上事件叫 onRecentContactListChangedVer2）。
+    try {
+        const cached = bridge && bridge.peers ? await bridge.peers() : null;
+        const list = (cached && cached.ok ? cached.data : cached) || [];
+        if (Array.isArray(list) && list.length > 0) {
+            diag(`[scan] 用缓存里的 ${list.length} 个会话`);
+            return list;
+        }
+    } catch (err) {
+        log('读会话缓存失败', err);
+    }
+
     const tries = [
         {
             cmdName: 'nodeIKernelRecentContactService/getRecentContactList',
             payload: [{ count: 200 }],
-            awaitMode: true
+            awaitMode: ['nodeIKernelRecentContactListener/onRecentContactListChangedVer2',
+                'nodeIKernelRecentContactListener/onRecentContactListChanged']
         },
         {
             cmdName: 'nodeIKernelRecentContactService/getRecentContactList',
             payload: [{ count: 200 }, null],
-            awaitMode: ['nodeIKernelRecentContactListener/onRecentContactListChanged']
+            awaitMode: ['nodeIKernelRecentContactListener/onRecentContactListChangedVer2',
+                'nodeIKernelRecentContactListener/onRecentContactListChanged']
         },
         { cmdName: 'nodeIKernelRecentContactService/getRecentContactList', payload: [], awaitMode: true }
     ];
 
-    for (const t of tries) {
+    for (let i = 0; i < tries.length; i++) {
+        const t = tries[i];
         const res = await callKernel(t.cmdName, t.payload, t.awaitMode);
+        diag(`[scan] 取会话列表 写法${i + 1} ${res ? '有返回 ' + Object.keys(res).slice(0, 6).join(',') : '空'}`);
+        if (res) {
+            try {
+                diag(`[scan] 原始 ${JSON.stringify(res).slice(0, 1200)}`);
+            } catch (_) {
+                /* 转不了就算了 */
+            }
+        }
         if (!res) continue;
         const out = [];
         const walk = (node, depth) => {
@@ -714,23 +836,37 @@ async function listPeers() {
 /** 把一条消息尝试转成卡片（界面层用的轻量版，实际解析在主进程/preload） */
 function toCard(msg, peer) {
     if (!msg || !Array.isArray(msg.elements)) return null;
+    const parser = requireRecordParser();
     for (const el of msg.elements) {
-        if (!el || !el.arkElement) continue;
-        const raw = el.arkElement.bytesData;
-        if (typeof raw !== 'string' || raw.indexOf('multimsg') === -1) continue;
-        let json = null;
-        try {
-            json = JSON.parse(raw);
-        } catch (_) {
-            continue;
+        // 先认新版 multiForwardMsgElement（XML），再退回老版 arkElement（JSON）
+        let card = parser.parseMultiForwardElement(el);
+        if (!card && el && el.arkElement) {
+            const raw = el.arkElement.bytesData;
+            if (typeof raw === 'string' && raw.indexOf('multimsg') !== -1) {
+                try {
+                    const json = JSON.parse(raw);
+                    const detail = (json.meta && json.meta.detail) || {};
+                    const resid0 = detail.m_resid || detail.resid || '';
+                    let title = '';
+                    if (Array.isArray(detail.news) && detail.news[0]) title = detail.news[0].text || '';
+                    else if (detail.news && typeof detail.news === 'object') title = detail.news.text || '';
+                    if (resid0) {
+                        card = {
+                            title: title || '聊天记录',
+                            preview: detail.source || '',
+                            summary: detail.summary || '',
+                            resid: resid0,
+                            fileName: detail.m_fileName || '',
+                            count: parseInt(String(detail.summary || '').replace(/\D/g, ''), 10) || 0
+                        };
+                    }
+                } catch (_) {
+                    /* 解析失败就换下一个元素 */
+                }
+            }
         }
-        const detail = (json.meta && json.meta.detail) || {};
-        const resid = detail.m_resid || detail.resid || '';
-        if (!resid) continue;
-        // news 有的版本是数组，有的版本是单个对象，都要兼容
-        let title = '';
-        if (Array.isArray(detail.news) && detail.news[0]) title = detail.news[0].text || '';
-        else if (detail.news && typeof detail.news === 'object') title = detail.news.text || '';
+        if (!card || !card.resid) continue;
+
         return {
             id: `${peer.chatType}:${peer.peerUid}:${msg.msgId}`,
             chatType: peer.chatType,
@@ -738,13 +874,13 @@ function toCard(msg, peer) {
             peerName: peer.__name || peer.name || peer.peerUid,
             msgId: String(msg.msgId || ''),
             msgSeq: String(msg.msgSeq || ''),
-            msgTime: requireRecordParser().normalizeTime(msg.msgTime),
+            msgTime: parser.normalizeTime(msg.msgTime),
             senderName: msg.sendMemberName || msg.sendNickName || '',
-            title: title || '聊天记录',
-            preview: detail.source || '',
-            count: parseInt((detail.summary || '').replace(/\D/g, ''), 10) || 0,
-            resid: resid,
-            fileName: detail.m_fileName || '',
+            title: card.title || '聊天记录',
+            preview: card.preview || '',
+            count: card.count || 0,
+            resid: card.resid,
+            fileName: card.fileName || '',
             innerState: 0,
             inner: []
         };
@@ -881,6 +1017,13 @@ async function openPanel() {
         if (STATE.query) doSearch();
     }
 
+    // 排障用：config 里写了 debugAutoQuery 就自动填好关键词并搜一次，
+    // 方便截图/远程看"搜出来长什么样"。默认没有这个配置项。
+    if (STATE.config && STATE.config.debugAutoQuery && !STATE.query) {
+        ui.input.value = STATE.query = STATE.config.debugAutoQuery;
+        doSearch();
+    }
+
     ui.mask.style.display = 'flex';
     STATE.open = true;
     setTimeout(() => ui.input.focus(), 30);
@@ -925,6 +1068,39 @@ function renderResultsArea() {
     }
 
     if (!STATE.query) {
+        // 索引空的时候，光说"输入关键词"没用——得直接给个能点的动作
+        const total = (STATE.stats && STATE.stats.total) || 0;
+        if (total === 0) {
+            body.innerHTML = `
+            <div class="fs-state fs-state-empty">
+                <div class="fs-art">
+                    <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
+                        <rect x="10" y="14" width="34" height="26" rx="6" stroke="currentColor" stroke-width="2.2" opacity=".55"/>
+                        <path d="M17 24h20M17 31h13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".38"/>
+                        <circle cx="42" cy="42" r="10" stroke="currentColor" stroke-width="2.4"/>
+                        <path d="M49.5 49.5L56 56" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+                    </svg>
+                </div>
+                <strong>索引里还没有卡片</strong>
+                先在 QQ 里打开一个有合并转发的群，然后点下面这个按钮。<br/>
+                只有 QQ 本地缓存过的会话（也就是你打开过的聊天）才读得到消息。
+                <div><button class="fs-btn fs-act-scan">扫描当前会话</button></div>
+                <div class="fs-hint">之后新收到的卡片会自动收录，不用再点。</div>
+            </div>`;
+            const scanBtn = body.querySelector('.fs-act-scan');
+            if (scanBtn) {
+                scanBtn.addEventListener('click', async () => {
+                    scanBtn.disabled = true;
+                    scanBtn.textContent = '扫描中…';
+                    await scanHistory(200);
+                    scanBtn.disabled = false;
+                    scanBtn.textContent = '扫描当前会话';
+                    renderResultsArea();
+                });
+            }
+            return;
+        }
+
         body.innerHTML = `
             <div class="fs-state fs-state-empty">
                 <div class="fs-art">
@@ -1282,9 +1458,12 @@ async function refreshStats() {
         const res = await bridge.stats();
         if (res && res.ok) {
             const s = res.data;
+            STATE.stats = s;
             _statsText = `已收录 ${s.total} 张卡片 · 其中 ${s.withInner} 张有完整内容`;
             const el = document.querySelector('.fs-foot-stat');
             if (el && !crawler.running) el.textContent = _statsText;
+            // 空状态依赖总数，统计变了要重画一次，不然会一直显示"还没有卡片"
+            if (STATE.open && !STATE.query) renderResultsArea();
         }
     } catch (_) {
         /* 统计失败不影响使用 */
@@ -1857,6 +2036,15 @@ async function bootstrap() {
         setTimeout(() => {
             if (!STATE.open) openPanel();
         }, 1500);
+    }
+
+    // 排障开关：debugAutoScan 打开后启动即扫描（不点按钮也能跑），用来验证内核接口是否可用。
+    // 数量故意给得小，避免一上来就发一堆请求。
+    if (STATE.config && STATE.config.debugAutoScan && isMainWindow()) {
+        setTimeout(() => {
+            diag('[scan] debugAutoScan 触发');
+            scanHistory(40).catch((err) => diag('[scan] 异常 ' + err));
+        }, 4000);
     }
 
     if (!bridge) {

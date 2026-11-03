@@ -5,7 +5,7 @@
     "name": "合并转发搜索",
     "slug": "forward-search",
     "description": "按内容搜索聊天里的合并转发卡片。输入一句话，直接找回那一整张聊天记录。",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "./assets/icon.png",
     "thumb": "./assets/thumb.png",
     "authors": [
@@ -15,7 +15,11 @@
         }
     ],
     "dependencies": [],
-    "platform": ["win32", "linux", "darwin"],
+    "platform": [
+        "win32",
+        "linux",
+        "darwin"
+    ],
     "injects": {
         "main": "./src/main.js",
         "preload": "./src/preload.js",

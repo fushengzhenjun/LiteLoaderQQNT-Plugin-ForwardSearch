@@ -117,7 +117,11 @@ function nativeCall(cmdName, payload, awaitCallback, timeoutMs = 8000) {
             if (!payloadObj) return;
 
             if (awaitCallback === true) {
-                if (envelopeObj.callbackId === callbackId) done(payloadObj);
+                if (envelopeObj.callbackId === callbackId) {
+                    // 把成功/失败状态一起带回去，出错时能一眼看出是接口被拒还是没数据
+                    const stat = envelopeObj.promiseStatue || envelopeObj.promiseStatus || 'ok';
+                    done(Object.assign({}, payloadObj, { __statue: stat }));
+                }
                 return;
             }
 
@@ -191,7 +195,9 @@ function maybeMessageEvent(cmdName) {
     if (!cmdName || typeof cmdName !== 'string') return false;
     return (
         cmdName.indexOf('MsgInfoList') !== -1 ||
-        cmdName.indexOf('onRecvMsg') !== -1 ||
+        // 9.9.31 上消息是通过 onRecvActiveMsg 推过来的，
+        // 早期只匹配了 onRecvMsg，结果一条都收不到（真机踩过这个坑）
+        /onRecv/i.test(cmdName) ||
         cmdName.indexOf('onAddSendMsg') !== -1 ||
         cmdName.indexOf('onMsgUpdate') !== -1 ||
         cmdName.indexOf('getMultiMsg') !== -1 ||
@@ -199,7 +205,32 @@ function maybeMessageEvent(cmdName) {
     );
 }
 
+/**
+ * 会话列表相关的事件。
+ * 注意 9.9.31 上是 `onRecentContactListChangedVer2`——带 Ver2 后缀，
+ * 早期版本叫 `onRecentContactListChanged`，两个都得认。
+ * QQ 启动时本来就会推这些，我们只是旁听，不需要额外发请求去要。
+ */
+function maybePeerEvent(cmdName) {
+    if (!cmdName || typeof cmdName !== 'string') return false;
+    return (
+        /RecentContactListChanged/i.test(cmdName) ||
+        /onGroupListUpdate|onGroupListChange/i.test(cmdName) ||
+        /onBuddyListChange/i.test(cmdName)
+    );
+}
+
+/** 把会话列表事件原样转给主进程，由主进程提取 peerUid / 名字 */
+function harvestPeers(payload) {
+    try {
+        ipcRenderer.send('forward-search:peers', payload);
+    } catch (err) {
+        console.warn('[forward-search] 会话列表转发失败', err);
+    }
+}
+
 let installed = false;
+
 function installPassiveCapture() {
     if (installed) return;
     const wid = getWebContentId();
@@ -212,6 +243,7 @@ function installPassiveCapture() {
             const payloadObj = body && typeof body === 'object' ? body : envelope;
             if (!payloadObj) return;
             if (maybeMessageEvent(payloadObj.cmdName)) harvestMessages(payloadObj);
+            if (maybePeerEvent(payloadObj.cmdName)) harvestPeers(payloadObj);
         } catch (err) {
             // 旁听失败绝不能让 QQ 崩
             console.warn('[forward-search] 被动收录出错', err);
@@ -270,6 +302,9 @@ const api = {
     search: (query, limit) => ipcRenderer.invoke('forward-search:search', query, limit),
     getCard: (id) => ipcRenderer.invoke('forward-search:get', id),
     stats: () => ipcRenderer.invoke('forward-search:stats'),
+    /** 旁听到的会话列表（扫描历史用） */
+    peers: () => ipcRenderer.invoke('forward-search:peers'),
+    lastPeer: () => ipcRenderer.invoke('forward-search:lastPeer'),
     pending: (limit, filter) => ipcRenderer.invoke('forward-search:pending', limit, filter),
     setInner: (id, inner, state) => ipcRenderer.invoke('forward-search:setInner', id, inner, state),
     compact: () => ipcRenderer.invoke('forward-search:compact'),

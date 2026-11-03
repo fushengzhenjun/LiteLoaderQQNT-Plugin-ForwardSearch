@@ -1,5 +1,31 @@
 # 更新日志
 
+## 1.0.1
+
+### 修复：真机上"能装上但搜不到东西"
+
+这一版把搜索结果从 0 条修到能正常出结果，全部是 9.9.31 真机踩出来的问题：
+
+- **被动收录一条都收不到**：QQ 9.9.31 用 `nodeIKernelMsgListener/onRecvActiveMsg` 推消息，
+  而过滤规则里写的是 `onRecvMsg`，子串对不上，等于把事件全丢了。改成认 `/onRecv/i`。
+- **扫描历史拿不到会话列表**：`getRecentContactList` 只回 `{result:0,errMsg:"success"}` 这种应答，
+  真实数据走 `onRecentContactListChangedVer2` 事件（带 Ver2 后缀），老代码等的是不带后缀的名字。
+  现在改成旁听 QQ 自己的推送，不额外发请求，结果缓存在 `peers.json`。
+- **取历史消息全部超时**：`getMsgsIncludeSelf` 要用对象参数 `[{peer,msgId,cnt,queryOrder}, null]`
+  并等同 `callbackId` 的应答；位置参数会被拒（`promiseStatue:"fail"`），
+  等 `onMsgInfoListUpdate` 永远等不到。
+- **认不出卡片**：9.9.31 的合并转发是 `elementType=16` 的 `multiForwardMsgElement`，
+  内容是 XML（`m_resid` / `tSum` / 若干 `<title>`），不是老的 `arkElement` JSON。
+  新增 XML 解析，并把里面那几行"昵称: 内容"直接当预览，所以**没补全也能搜到卡片里的开头几句**。
+
+### 已知限制
+
+- 只有 QQ **本地缓存过**的会话（你打开过的聊天）才读得到历史，没打开过的返回空列表。
+  这不是插件的问题，是服务端不下发。
+- 完整正文（`getMultiMsg`）在 9.9.31 上会被服务端拒绝（`server return failed`）或返回空列表，
+  所以目前能搜到的是卡片预览里的前几行。补全会继续按失败处理，不会卡住。
+
+
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)：`主版本.次版本.修订号`。
 
 ## 1.0.0 — 首个可用版本

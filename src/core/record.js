@@ -68,6 +68,76 @@ function normalizeTime(value) {
  * 判断一段 ark 的 bytesData 是不是合并转发卡片，并解析出外层信息。
  * 返回 null 表示"不是合并转发"。
  */
+/** XML 里那几个转义字符还原回来，不然搜"&amp;"这类会漏 */
+function xmlUnescape(text) {
+    return String(text || '')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, '&');
+}
+
+/**
+ * 9.9.31 起，合并转发卡片是 elementType=16 的 multiForwardMsgElement，
+ * 内容是一段 XML 字符串（不是以前那种 arkElement 的 JSON）。
+ *
+ * XML 长这样：
+ *   <msg serviceID="35" action="viewMultiMsg" m_fileName=".." m_resid=".." tSum="6">
+ *     <item><title size="34">群聊的聊天记录</title>
+ *           <title size="26">张三: 第一句</title>
+ *           <title size="26">李四: 第二句</title>
+ *           <summary>查看6条转发消息</summary></item>
+ *   </msg>
+ *
+ * 关键点：后面那几行 title 就是卡片内部的开头几条消息，**可以直接拿来搜**，
+ * 所以即使还没拉取完整内容，也能搜到一部分。
+ */
+function parseMultiForwardElement(el) {
+    if (!el || typeof el !== 'object' || !el.multiForwardMsgElement) return null;
+
+    const node = el.multiForwardMsgElement;
+    const xml = typeof node.xmlContent === 'string' ? node.xmlContent : '';
+    if (!xml) return null;
+    if (xml.indexOf('viewMultiMsg') === -1 && xml.indexOf('m_resid') === -1) return null;
+
+    const attr = (name) => {
+        const m = xml.match(new RegExp(`${name}="([^"]*)"`));
+        return m ? m[1] : '';
+    };
+
+    const titles = [];
+    const re = /<title[^>]*>([\s\S]*?)<\/title>/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) titles.push(xmlUnescape(m[1].trim()));
+
+    const summaryMatch = xml.match(/<summary[^>]*>([\s\S]*?)<\/summary>/);
+    const summary = summaryMatch ? xmlUnescape(summaryMatch[1].trim()) : '';
+    const sourceMatch = xml.match(/<source[^>]*name="([^"]*)"/);
+
+    const title = titles[0] || '聊天记录';
+    const preview = titles.slice(1).join(' / ') || (sourceMatch ? xmlUnescape(sourceMatch[1]) : '');
+    const count = pickCount(summary) || parseInt(attr('tSum'), 10) || 0;
+
+    return {
+        title: String(title).slice(0, 60),
+        preview: String(preview).slice(0, 300),
+        summary: summary.slice(0, 120),
+        resid: String(node.resId || attr('m_resid') || ''),
+        fileName: String(node.fileName || attr('m_fileName') || ''),
+        count
+    };
+}
+
+/**
+ * 兼容两种卡片形态：新的 multiForwardMsgElement（XML）和老的 arkElement（JSON）。
+ * 老的留着是为了让用户翻旧记录时也能认出来。
+ */
+function parseCardFromElement(el) {
+    if (!el || typeof el !== 'object') return null;
+    return parseMultiForwardElement(el) || (el.arkElement ? parseArkCard(el.arkElement.bytesData) : null);
+}
+
 function parseArkCard(bytesData) {
     if (typeof bytesData !== 'string' || bytesData.length === 0) return null;
 
@@ -196,12 +266,10 @@ function cardFromMessage(msg, context) {
 
     let card = null;
     for (const el of msg.elements) {
-        if (el && el.arkElement) {
-            const parsed = parseArkCard(el.arkElement.bytesData);
-            if (parsed && parsed.resid) {
-                card = parsed;
-                break;
-            }
+        const parsed = parseCardFromElement(el);
+        if (parsed && parsed.resid) {
+            card = parsed;
+            break;
         }
     }
     if (!card) return null;
@@ -236,6 +304,8 @@ function cardFromMessage(msg, context) {
 
 module.exports = {
     parseArkCard,
+    parseMultiForwardElement,
+    parseCardFromElement,
     parseInnerRecords,
     cardFromMessage,
     messageToText,

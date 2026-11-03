@@ -194,6 +194,111 @@ function markSeen(id) {
 /** 群名/好友名缓存，展示"群名称"要用 */
 const peerNames = new Map();
 
+/* ------------------------------------------------------------------
+ * 会话缓存
+ * ------------------------------------------------------------------
+ * 扫描历史需要知道"有哪些群/好友"。本来想直接调 getRecentContactList 要，
+ * 但真机上这个接口只回 {result:0,errMsg:"success"} 这种应答，数据是从
+ * `nodeIKernelRecentContactListener/onRecentContactListChangedVer2` 事件推过来的。
+ *
+ * 既然 QQ 启动时本来就会推全量列表，那就别另发请求了——旁听即可，
+ * 既不增加请求量，也不会因为接口改名而失效。
+ * ------------------------------------------------------------------ */
+
+const peerMap = new Map(); // peerUid -> { chatType, peerUid, guildId, name }
+let lastActivePeer = null; // 最近收到消息的会话，用来验证"本地缓存"范围
+let peerSaveTimer = null;
+let peerFile = '';
+
+function loadPeers() {
+    if (!peerFile) return;
+    try {
+        if (!fs.existsSync(peerFile)) return;
+        const arr = JSON.parse(fs.readFileSync(peerFile, 'utf8'));
+        for (const p of arr || []) {
+            if (p && p.peerUid) peerMap.set(String(p.peerUid), p);
+        }
+        console.log(`[forward-search] 载入 ${peerMap.size} 个会话记录`);
+    } catch (err) {
+        console.warn('[forward-search] 读取会话缓存失败', err);
+    }
+}
+
+function savePeersSoon() {
+    if (peerSaveTimer) return;
+    peerSaveTimer = setTimeout(() => {
+        peerSaveTimer = null;
+        try {
+            fs.writeFileSync(peerFile, JSON.stringify(Array.from(peerMap.values())), 'utf8');
+        } catch (err) {
+            console.warn('[forward-search] 写会话缓存失败', err);
+        }
+    }, 2000);
+    if (peerSaveTimer.unref) peerSaveTimer.unref();
+}
+
+function notePeer(chatType, peerUid, name) {
+    const uid = peerUid === undefined || peerUid === null ? '' : String(peerUid);
+    if (!uid) return false;
+    const old = peerMap.get(uid);
+    const t = Number(chatType) || (old && old.chatType) || 2;
+    const n = name || (old && old.name) || '';
+    if (old && old.chatType === t && old.name === n) return false;
+    peerMap.set(uid, { chatType: t, peerUid: uid, guildId: '', name: n });
+    return true;
+}
+
+/** 从任意形状的会话列表事件里捞出 peerUid + 名字 */
+function harvestPeers(payload) {
+    const root = payload && payload.payload ? payload.payload : payload;
+    let changed = 0;
+
+    const walk = (node, depth) => {
+        if (!node || typeof node !== 'object' || depth > 7) return;
+
+        if (Array.isArray(node)) {
+            for (const item of node) walk(item, depth + 1);
+            return;
+        }
+
+        // 最近联系人 / 消息里自带 peerUid
+        if (node.peerUid) {
+            const t = node.chatType !== undefined ? node.chatType : node.peerType;
+            if (t !== undefined) {
+                const name = node.peerName || node.remark || node.sendMemberName || node.peerNickName || '';
+                if (notePeer(t, node.peerUid, name)) changed++;
+            }
+        }
+
+        // 群列表：groupCode 就是群号
+        if (node.groupCode && (node.groupName || node.groupRemark)) {
+            if (notePeer(2, node.groupCode, node.groupRemark || node.groupName)) changed++;
+        }
+
+        // 好友列表：uid + nick/remark
+        if (node.uid && !node.peerUid && (node.nick || node.remark)) {
+            if (notePeer(1, node.uid, node.remark || node.nick)) changed++;
+        }
+
+        for (const key of Object.keys(node)) {
+            const v = node[key];
+            if (v && typeof v === 'object') walk(v, depth + 1);
+        }
+    };
+
+    try {
+        walk(root, 0);
+    } catch (err) {
+        console.warn('[forward-search] 解析会话列表失败', err);
+    }
+
+    if (changed > 0) {
+        console.log(`[forward-search] 会话缓存 ${peerMap.size} 个（新增/更新 ${changed}）`);
+        savePeersSoon();
+    }
+    return peerMap.size;
+}
+
 function captureFromPayload(payload) {
     if (!payload || !config || config.passiveCapture === false) return 0;
 
@@ -218,6 +323,15 @@ function captureFromPayload(payload) {
 
             try {
                 const peerUid = msg.peerUid;
+                // 记一下最近活跃会话：只有它的消息在本地缓存里，排除/定位问题时有用
+                if (peerUid) {
+                    lastActivePeer = {
+                        chatType: Number(msg.chatType) || 2,
+                        peerUid: String(peerUid),
+                        guildId: '',
+                        name: peerNames.get(String(peerUid)) || ''
+                    };
+                }
                 const name = msg.peerName || msg.peerNickName;
                 if (peerUid && name && !peerNames.has(peerUid)) peerNames.set(peerUid, name);
 
@@ -281,11 +395,22 @@ function setupIpc() {
         }
     });
 
+    // ---- 会话列表（同理，旁听 QQ 自己的推送，扫描历史时要用）----
+    ipcMain.on('forward-search:peers', (_event, payload) => {
+        try {
+            harvestPeers(payload);
+        } catch (err) {
+            console.warn('[forward-search] 整理会话列表出错', err);
+        }
+    });
+
     // ---- 数据 ----
     handle('upsert', (records) => store.upsertMany(records));
     handle('search', (query, limit) => store.search(query, limit || config.maxResults));
     handle('get', (id) => store.get(id));
     handle('stats', () => store.stats());
+    handle('peers', () => Array.from(peerMap.values()));
+    handle('lastPeer', () => lastActivePeer);
     handle('pending', (limit, filter) => store.pending(limit || 100, filter || {}));
     handle('setInner', (id, inner, state) => store.setInner(id, inner, state));
     handle('compact', () => store.compact());
@@ -323,6 +448,9 @@ exports.onBrowserWindowCreated = (_window) => {
 
     store = new CardStore(dataDir);
     const count = store.load();
+
+    peerFile = path.join(dataDir, 'peers.json');
+    loadPeers();
     console.log(`[forward-search] 已载入 ${count} 条卡片记录，数据目录：${dataDir}`);
 
     setupIpc();
