@@ -29,7 +29,7 @@
         "repo": "fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch",
         "branch": "main",
         "release": {
-            "tag": "1.0.0",
+            "tag": "1.0.3",
             "file": "forward-search.zip"
         }
     }
