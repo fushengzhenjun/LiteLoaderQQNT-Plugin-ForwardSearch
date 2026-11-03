@@ -6,15 +6,29 @@
 
 ## 界面
 
-| 主面板（右上角入口 + 右下角悬浮按钮） | 悬浮按钮（可拖动，位置会记住） |
+### 入口在哪
+
+装好之后，QQ 主面板上有两个入口，红框标出来的就是：
+
+![主面板上的两个入口](docs/screenshots/overview.png)
+
+| ① 顶栏「卡片搜索」 | ② 右下角悬浮球 |
 |---|---|
-| ![主面板](docs/screenshots/overview.png) | ![悬浮按钮](docs/screenshots/float-button.png) |
+| ![顶栏入口](docs/screenshots/entry-topbar.png) | ![悬浮按钮](docs/screenshots/entry-float.png) |
+
+- 顶栏那个：跟着 QQ 顶栏走，窗口缩放时位置不变，永远在窗口按钮左边
+- 悬浮球：按住能拖，拖到哪记到哪，下次启动还在那
+- 两个都不点也行，`Alt + S` 一样能开
+
+### 打开的弹窗
 
 | 浅色 | 深色 |
 |---|---|
 | ![浅色弹窗](docs/screenshots/popup-light.png) | ![深色弹窗](docs/screenshots/popup-dark.png) |
 
-> 截图里的会话列表和昵称做了马赛克处理。
+默认跟随系统深浅色，不用自己选。
+
+> 截图里的会话列表和昵称做了马赛克处理；弹窗是刚装好、还没收录卡片时的样子。
 
 ---
 
