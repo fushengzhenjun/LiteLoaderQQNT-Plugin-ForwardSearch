@@ -1,5 +1,17 @@
 # 发布清单
 
+> **当前状态（2026-11-03）**
+>
+> | 项 | 状态 |
+> |---|---|
+> | GitHub 仓库 | ✅ https://github.com/fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch |
+> | Release 1.0.0 | ✅ 已发布，资产 `forward-search.zip`（12 个文件，首层即 `forward-search/`） |
+> | 插件市场 PR | ✅ 已提交 → https://github.com/LiteLoaderQQNT/Plugin-List/pull/128 （等维护者合并） |
+> | 自动打包 CI | ⚠️ 未启用，见文末「关于 CI」 |
+> | 商店截图 | ❌ 仍是本机真机图，含真实群名，合并前需替换 |
+>
+> 下面保留完整流程，方便下次发版照着走。
+
 从「本机能用」到「别人能装」，中间隔的不是技术，是这几件小事。按顺序做，大约 40 分钟。
 
 ---
@@ -147,3 +159,49 @@ CI 会做三件事：校验 tag 和 `manifest.json` 的 `version` 一致、校�
 代码已经写完了，发布要补的其实只有四样：**真名字、真图标（已有）、正确的 zip 结构、一张不漏隐私的截图**。剩下全是点鼠标的活。
 
 `manifest.json` 里那两个 `TODO_YOUR` 一填，就可以走了。
+
+---
+
+## 关于 CI（这次为什么没启用）
+
+本想用 GitHub Actions 自动打包，但推送被拒：
+
+```
+refusing to allow an OAuth App to create or update workflow `.github/workflows/release.yml`
+without `workflow` scope
+```
+
+当前的 gh 令牌只有 `repo` 权限，推不了 `.github/workflows/` 下的文件。
+
+**想启用**，两步：
+
+```bash
+gh auth refresh -s workflow          # 浏览器点一下授权
+mkdir -p .github/workflows
+mv docs/release-workflow.yml.bak .github/workflows/release.yml
+git add . && git commit -m "ci: 打 tag 自动打包发 Release" && git push
+```
+
+之后每次发版只要 `git tag 1.0.1 && git push origin 1.0.1`，包会自动挂到 Release 上。
+
+**不启用也没问题**，本次的手动流程已经跑通：
+
+```bash
+# 打 tag
+git tag 1.0.1 && git push origin 1.0.1
+# 本地出包（只带运行必需文件）
+python - <<'PY'
+import subprocess, zipfile
+files = subprocess.check_output(['git','ls-files'], text=True).splitlines()
+keep = {'manifest.json','README.md','LICENSE','CHANGELOG.md'}
+with zipfile.ZipFile('dist/forward-search.zip','w',zipfile.ZIP_DEFLATED) as z:
+    for f in files:
+        if f.startswith(('src/','assets/')) or f in keep:
+            z.write(f, 'forward-search/'+f)
+PY
+# 挂到 Release
+gh release create 1.0.1 dist/forward-search.zip -R fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch \
+  --title "v1.0.1" --notes "改了什么写这里"
+```
+
+别忘了同步 `manifest.json` 里的 `version` 和 `repository.release.tag`。
