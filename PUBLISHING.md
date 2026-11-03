@@ -8,7 +8,7 @@
 > | Release 1.0.0 | ✅ 已发布，资产 `forward-search.zip`（12 个文件，首层即 `forward-search/`） |
 > | 插件市场 PR | ✅ 已提交 → https://github.com/LiteLoaderQQNT/Plugin-List/pull/128 （等维护者合并） |
 > | 自动打包 CI | ⚠️ 未启用，见文末「关于 CI」 |
-> | 商店截图 | ❌ 仍是本机真机图，含真实群名，合并前需替换 |
+> | 商店截图 | ✅ 已打码入库（`docs/screenshots/`，会话列表与昵称已像素化） |
 >
 > 下面保留完整流程，方便下次发版照着走。
 

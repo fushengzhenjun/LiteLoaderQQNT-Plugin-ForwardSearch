@@ -4,6 +4,20 @@
 
 ---
 
+## 界面
+
+| 主面板（右上角入口 + 右下角悬浮按钮） | 悬浮按钮（可拖动，位置会记住） |
+|---|---|
+| ![主面板](docs/screenshots/overview.png) | ![悬浮按钮](docs/screenshots/float-button.png) |
+
+| 浅色 | 深色 |
+|---|---|
+| ![浅色弹窗](docs/screenshots/popup-light.png) | ![深色弹窗](docs/screenshots/popup-dark.png) |
+
+> 截图里的会话列表和昵称做了马赛克处理。
+
+---
+
 ## 一、这东西解决什么问题
 
 QQ 群里经常有人发「合并转发」的聊天记录卡片。QQ 自带的搜索有个很大的毛病：
