@@ -5,7 +5,8 @@
 > | 项 | 状态 |
 > |---|---|
 > | GitHub 仓库 | ✅ https://github.com/fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch |
-> | Release 1.0.0 | ✅ 已发布，资产 `forward-search.zip`（12 个文件，首层即 `forward-search/`） |
+> | Release 1.0.3 | ✅ 已发布（定位到原消息），资产 `forward-search.zip`（12 个文件，首层即 `forward-search/`） |
+> | 历史版本 | 1.0.0 / 1.0.3 两个 Release；`manifest.json` 的 `repository.release.tag` 跟着当前版本走 |
 > | 插件市场 PR | ✅ 已提交 → https://github.com/LiteLoaderQQNT/Plugin-List/pull/128 （等维护者合并） |
 > | 自动打包 CI | ⚠️ 未启用，见文末「关于 CI」 |
 > | 商店截图 | ✅ 已打码入库（`docs/screenshots/`，会话列表与昵称已像素化） |
