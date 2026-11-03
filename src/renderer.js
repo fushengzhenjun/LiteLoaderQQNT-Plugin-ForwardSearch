@@ -61,9 +61,7 @@ const STATE = {
     searching: false,
     error: '',
     config: null,
-    currentCard: null,
-    // 正在聊天里找卡片时不重复触发（滚动 + 查找是异步的，手快会打架）
-    locating: false
+    currentCard: null
 };
 
 /** 把 HTML 特殊字符转义，防止卡片里的文字把界面结构搞坏 */
@@ -1282,8 +1280,11 @@ function splitPreview(preview) {
  *
  * 分三步，任何一步失败都降级，不抛异常：
  *   1. 切会话（优先点左侧会话列表，失败再调内核接口）
- *   2. 在消息列表里往上翻，按卡片封面上的文字匹配出那一条
- *   3. 滚到屏幕中间 + 画一个高亮圈
+ *   2. 先看当前这一屏有没有它（有就直接圈出来）
+ *   3. 没有的话挂个观察者：用户往上翻，卡片一进视野立刻圈住
+ *
+ * 为什么不让插件自己翻：QQ 9.9 的消息区是虚拟列表，只认真实滚轮，
+ * 脚本改 scrollTop / 派发 wheel 都不动（真机实测）。所以只能"陪用户翻"。
  */
 async function tryJumpToChat(card, opts) {
     const autoClose = !(opts && opts.keepPanel);
@@ -1302,9 +1303,9 @@ async function tryJumpToChat(card, opts) {
         return false;
     }
 
-    // 2. 等界面把消息渲染出来，再去找那张卡片
-    await sleep(650);
-    const node = await locateCardInChat(card);
+    // 2. 等界面把消息渲染出来，先看这一屏有没有
+    await sleep(800);
+    const node = locateCardInView(card);
 
     if (node) {
         jumpNotice = '';
@@ -1313,10 +1314,15 @@ async function tryJumpToChat(card, opts) {
         return true;
     }
 
-    // 3. 切过去了但没找到：多半是消息太旧、还没加载出来。
-    //    这时候不自动关面板，免得把用户丢在一个空界面上。
-    jumpNotice = `已经切到「${card.peerName || '聊天'}」，但在聊天里没定位到这张卡片。可能消息太旧还没加载出来，往上翻一翻。`;
-    renderDetail();
+    // 3. 这一屏没有：关掉弹窗，让用户能滚聊天；插件在后台盯着，
+    //    卡片一被翻进视野就圈出来（弹窗不关的话，遮罩会把滚轮挡住）。
+    const watching = watchCardInChat(card, { open: false });
+    if (autoClose) closePanel();
+    showFloatingToast(
+        watching
+            ? `已切到「${card.peerName || '聊天'}」，往上翻一点，看到这张卡片我会圈出来`
+            : `已切到「${card.peerName || '聊天'}」，卡片不在当前这一屏，往上翻翻`
+    );
     return false;
 }
 
@@ -1394,43 +1400,35 @@ function clickChatInUi(card) {
  * 它和聊天里那张卡片显示的字是同一份，所以命中率不错。
  * ------------------------------------------------------------------ */
 
-/** 这个元素自己能滚吗（排除我们自己的弹窗） */
-function isScrollableBox(el) {
-    if (!el || el.nodeType !== 1) return false;
-    if (el.closest && el.closest('.fs-root')) return false;
-    const st = getComputedStyle(el);
-    if (!/(auto|scroll|overlay)/.test(st.overflowY)) return false;
-    return el.scrollHeight > el.clientHeight + 40 && el.clientHeight > 140;
-}
+/**
+ * 聊天消息区。
+ *
+ * 真机上（QQ 9.9.31）是 `.chat-msg-area` 里的虚拟列表 `.ml-list`：
+ * 它自己不做原生滚动——高度永远等于可视高度，滑动由 QQ 自己的逻辑接管，
+ * 所以 `scrollTop` / `scrollIntoView` / 合成 wheel 事件统统推不动它。
+ * 这条是量出来的：连 `:hover` 都进不去，只有真实鼠标滚轮才管用。
+ *
+ * 结论：插件不能"替用户翻"，只能"陪用户翻"——
+ * 切到会话后盯着这块区域，用户一翻到那张卡片，我们立刻圈住它。
+ */
+function chatRoot() {
+    const byClass = document.querySelector('.chat-msg-area') || document.querySelector('.ml-list');
+    if (byClass) return byClass;
 
-/** 找聊天消息区的滚动容器：右侧面积最大的那个可滚动块 */
-function findChatScroller(needles) {
-    const match = Array.isArray(needles) ? needles : [];
+    // 老版本/别的皮肤：退回"右侧最大的可滚动块"
     const vw = window.innerWidth;
-    const right = [];
-    const any = [];
-
-    document.querySelectorAll('div, ul, section, main, article').forEach((el) => {
-        if (!isScrollableBox(el)) return;
+    let best = null;
+    document.querySelectorAll('div, ul, section, main').forEach((el) => {
+        if (!el || el.nodeType !== 1 || (el.closest && el.closest('.fs-root'))) return;
+        const st = getComputedStyle(el);
+        if (!/(auto|scroll|overlay)/.test(st.overflowY)) return;
+        if (el.scrollHeight <= el.clientHeight + 40 || el.clientHeight < 140) return;
         const r = el.getBoundingClientRect();
-        if (r.width < 200 || r.height < 150) return;
-        any.push({ el, area: r.width * r.height });
-        if (r.right >= vw * 0.35) right.push({ el, area: r.width * r.height }); // 右边才是聊天区
+        if (r.width < 200 || r.right < vw * 0.35) return;
+        const area = r.width * r.height;
+        if (!best || area > best.area) best = { el, area };
     });
-
-    // 优先用"当前就能看到目标文字"的那一个：卡片就在眼前时，这个判断最准。
-    // 都不含目标文字时，退回到面积最大的那个（一般就是消息列表）。
-    const pools = right.length > 0 ? [right, any] : [any];
-    for (const pool of pools) {
-        const hit = pool.find((c) => {
-            const txt = c.el.textContent || '';
-            return match.some((n) => txt.indexOf(n) !== -1);
-        });
-        if (hit) return hit.el;
-    }
-
-    const best = (right.length > 0 ? right : any).sort((a, b) => b.area - a.area);
-    return best.length > 0 ? best[0].el : null;
+    return best ? best.el : null;
 }
 
 /** 从卡片里挑出几段"足够独特"的原文，用来在聊天里认出它 */
@@ -1459,8 +1457,6 @@ function locateNeedles(card) {
 function searchCardIn(scroller, card, needles) {
     if (!scroller || needles.length === 0) return null;
 
-    // 先在"像消息的节点"里找，命中不了再退化成全量扫描。
-    // 全量扫一次几百上千个节点，翻 30 屏就是几万次，能省则省。
     let nodes = scroller.querySelectorAll(
         '[class*="message"], [class*="msg"], [class*="bubble"], [class*="card"], [class*="record"], [class*="item"]'
     );
@@ -1490,56 +1486,127 @@ function searchCardIn(scroller, card, needles) {
     return best ? { el: best, score: bestScore } : null;
 }
 
-/** 在消息列表里往上翻，直到找到这张卡片；找不到返回 null */
-async function locateCardInChat(card) {
-    if (STATE.locating) return null;
-    STATE.locating = true;
-    try {
-        const needles = locateNeedles(card);
-        if (needles.length === 0) return null;
-
-        const scroller = findChatScroller(needles);
-        if (!scroller) {
-            diag('[locate] 没找到聊天的滚动容器');
-            return null;
-        }
-        diag(
-            `[locate] 容器 ${scroller.tagName.toLowerCase()}.${String(scroller.className).slice(0, 36)} ` +
-                `sh=${scroller.scrollHeight} ch=${scroller.clientHeight} top=${Math.round(scroller.scrollTop)}`
-        );
-
-        let hit = searchCardIn(scroller, card, needles);
-
-        for (let round = 0; !hit && round < 30; round++) {
-            const before = scroller.scrollTop;
-            if (before <= 0) break;
-
-            scroller.scrollTop = Math.max(0, before - scroller.clientHeight * 0.85);
-            scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-
-            // 等 QQ 把上一批消息渲染出来（虚拟列表 + 懒加载，得给点时间）
-            await sleep(300);
-            hit = searchCardIn(scroller, card, needles);
-
-            // 滚不动了说明到底了
-            if (!hit && Math.abs(scroller.scrollTop - before) < 4) break;
-        }
-
-        if (!hit) {
-            diag(`[locate] 翻了 30 屏没找到：needles=${needles.join('|').slice(0, 60)}`);
-            return null;
-        }
-
-        if (hit.el.scrollIntoView) hit.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-        await sleep(420);
-        highlightLocated(hit.el);
-        diag(`[locate] 命中 score=${hit.score} class=${String(hit.el.className).slice(0, 40)}`);
-        return hit.el;
-    } catch (err) {
-        diag('[locate] 出错 ' + err);
+/** 在"当前这一屏"里定位。找得到就圈出来，找不到返回 null（不硬滚） */
+function locateCardInView(card) {
+    const root = chatRoot();
+    if (!root) {
+        diag('[locate] 没有聊天区');
         return null;
-    } finally {
-        STATE.locating = false;
+    }
+    const hit = searchCardIn(root, card, locateNeedles(card));
+    if (!hit) {
+        diag('[locate] 当前这一屏没有匹配');
+        return null;
+    }
+    if (hit.el.scrollIntoView) hit.el.scrollIntoView({ block: 'center' });
+    highlightLocated(hit.el);
+    diag(`[locate] 命中 score=${hit.score} class=${String(hit.el.className).slice(0, 40)}`);
+    return hit.el;
+}
+
+/* ------------------------------------------------------------------
+ * 盯着聊天区，等用户把卡片翻出来
+ * ------------------------------------------------------------------
+ * QQ 的虚拟列表只认真实滚轮（合成事件推不动），所以定位不能靠脚本翻页。
+ * 换个做法：切到会话后留个观察者挂在消息区上，一旦目标卡片被滚进视野，
+ * 立刻画圈、提示，必要时替用户点开原生卡片窗口。
+ * ------------------------------------------------------------------ */
+
+let cardWatcher = null;
+
+function stopCardWatch() {
+    if (cardWatcher) {
+        try {
+            cardWatcher.stop();
+        } catch (_) { /* 忽略 */ }
+        cardWatcher = null;
+    }
+}
+
+/**
+ * @param {object} card 目标卡片
+ * @param {object} opts { open: 找到后是否自动点开, timeout: 毫秒 }
+ * @returns {boolean} 是否成功挂上
+ */
+function watchCardInChat(card, opts) {
+    stopCardWatch();
+    const needles = locateNeedles(card);
+    if (!needles.length) return false;
+    if (!chatRoot()) return false;
+
+    const openAfter = !!(opts && opts.open);
+    const life = (opts && opts.timeout) || 120000;
+    let stopped = false;
+
+    const tick = () => {
+        if (stopped) return;
+        const root = chatRoot();
+        if (!root) return;
+        const hit = searchCardIn(root, card, needles);
+        if (!hit) return;
+
+        stop();
+        highlightLocated(hit.el);
+        showFloatingToast(openAfter ? '找到了，正在打开原卡片…' : '找到了，就是这张');
+        if (openAfter) setTimeout(() => clickCardNode(hit.el), 400);
+        diag('[locate] 观察者命中');
+    };
+
+    let debounceTimer = null;
+    const schedule = () => {
+        if (stopped) return;
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(tick, 220);
+    };
+
+    let obs = null;
+    try {
+        obs = new MutationObserver(schedule);
+        const root = chatRoot();
+        if (root) obs.observe(root, { childList: true, subtree: true });
+        else obs.observe(document.body, { childList: true, subtree: true });
+    } catch (_) { /* 观察不了就靠定时器 */ }
+
+    const iv = setInterval(tick, 900);
+    const timeout = setTimeout(() => stop(), life);
+
+    function stop() {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(iv);
+        clearTimeout(timeout);
+        if (debounceTimer) clearTimeout(debounceTimer);
+        if (obs) obs.disconnect();
+        if (cardWatcher && cardWatcher.__self === stop) cardWatcher = null;
+    }
+
+    cardWatcher = { stop, __self: stop };
+    tick(); // 也许卡片本来就在视野里
+    return true;
+}
+
+/** 替用户点一下卡片，让 QQ 自己弹出"聊天记录"窗口（图片、文件都在里面） */
+function clickCardNode(el) {
+    if (!el) return false;
+    let target = el;
+    for (let i = 0; i < 4; i++) {
+        const cls = String(target.className || '');
+        if (/card|forward|multi|bubble|message|item/i.test(cls)) break;
+        if (!target.parentElement || target.parentElement === document.body) break;
+        target = target.parentElement;
+    }
+    const o = { bubbles: true, cancelable: true, view: window };
+    try {
+        target.dispatchEvent(new PointerEvent('pointerdown', o));
+        target.dispatchEvent(new MouseEvent('mousedown', o));
+        target.dispatchEvent(new PointerEvent('pointerup', o));
+        target.dispatchEvent(new MouseEvent('mouseup', o));
+        target.dispatchEvent(new MouseEvent('click', o));
+        diag('[locate] 已点击卡片');
+        return true;
+    } catch (err) {
+        diag('[locate] 点击失败 ' + err);
+        return false;
     }
 }
 
@@ -1579,47 +1646,30 @@ function showFloatingToast(message) {
 }
 
 /**
- * 定位到卡片之后，再替用户点一下它——QQ 会弹出原生的"聊天记录"窗口，
- * 里面的图片、文件、表情全都在。这是详情页唯一显示不了的东西。
+ * 打开原卡片：定位到它，然后替用户点一下——
+ * QQ 会弹出原生的"聊天记录"窗口，里面的图片、文件、表情都在。
+ * 如果卡片不在当前这一屏，就挂着观察者，等用户滚到那儿自动点开。
  */
 async function openOriginalCard(card) {
-    const el = await locateCardInChat(card);
-    if (!el) {
-        toast('没能在聊天里定位到这张卡片');
-        return false;
-    }
-    await sleep(500);
-
-    // 找到真正可点击的那一层（卡片本体一般有几个带 card/forward/bubble 的类名）
-    let target = el;
-    for (let i = 0; i < 4; i++) {
-        const cls = String(target.className || '');
-        if (/card|forward|multi|bubble|message|item/i.test(cls)) break;
-        if (!target.parentElement || target.parentElement === document.body) break;
-        target = target.parentElement;
-    }
-
-    const opts = { bubbles: true, cancelable: true, view: window };
-    try {
-        target.dispatchEvent(new PointerEvent('pointerdown', opts));
-        target.dispatchEvent(new MouseEvent('mousedown', opts));
-        target.dispatchEvent(new PointerEvent('pointerup', opts));
-        target.dispatchEvent(new MouseEvent('mouseup', opts));
-        target.dispatchEvent(new MouseEvent('click', opts));
-        diag('[locate] 已点击卡片，尝试打开原生窗口');
+    const el = locateCardInView(card);
+    if (el) {
+        await sleep(400);
+        clickCardNode(el);
         showFloatingToast('已打开原卡片，图片在里面');
         setTimeout(() => closePanel(), 200);
         return true;
-    } catch (err) {
-        diag('[locate] 点击卡片失败 ' + err);
-        return false;
     }
+
+    const watching = watchCardInChat(card, { open: true });
+    if (watching) {
+        closePanel();
+        showFloatingToast(`往上翻到「${card.title || '这张卡片'}」，我会自动帮你打开`);
+        return true;
+    }
+    toast('没能在聊天里定位到这张卡片');
+    return false;
 }
 
-/**
- * 消息正文渲染。图片/视频/语音/文件这几种，插件拿不到内容本身
- * （QQ 不在 XML 里放原图地址），所以做成小胶囊，配合下面的"定位"按钮用。
- */
 function renderMsgText(text) {
     const raw = String(text == null ? '' : text);
     if (!raw) return '<span class="fs-msg-media">空消息</span>';
