@@ -1025,6 +1025,7 @@ async function openPanel() {
     }
 
     ui.mask.style.display = 'flex';
+    hideWatchBar();
     STATE.open = true;
     setTimeout(() => ui.input.focus(), 30);
     refreshStats();
@@ -1035,7 +1036,8 @@ function closePanel() {
     ui.mask.style.display = 'none';
     STATE.open = false;
     STATE.mode = 'search';
-    if (ui.input) ui.input.value = STATE.query = '';
+    // 关键词和结果留着：定位完想再搜同一条时，不用重敲一遍
+    // （以前这里会把 query 清空，导致"回到搜索结果"没东西可回）
 }
 
 /* ---------- 各区域的渲染 ---------- */
@@ -1309,20 +1311,34 @@ async function tryJumpToChat(card, opts) {
 
     if (node) {
         jumpNotice = '';
-        showFloatingToast(`已定位到「${card.peerName || '聊天'}」里的这张卡片`);
-        if (autoClose) setTimeout(() => closePanel(), 260);
+        if (autoClose) setTimeout(() => closePanel(), 300);
+        showWatchBar('已定位到这张卡片（蓝圈就在聊天区），圈 2.6 秒后自动消失', 'hit');
+        hideWatchBar(4000);
         return true;
     }
 
-    // 3. 这一屏没有：关掉弹窗，让用户能滚聊天；插件在后台盯着，
-    //    卡片一被翻进视野就圈出来（弹窗不关的话，遮罩会把滚轮挡住）。
-    const watching = watchCardInChat(card, { open: false });
+    // 3. 这一屏没有：收起弹窗（不然遮罩挡住滚轮），但留一条状态条说明在等什么。
+    //    之前这里是"直接关掉 + 转瞬即逝的提示"，看起来像插件崩了，改成常驻状态条。
+    const watching = watchCardInChat(card, {
+        open: false,
+        onHit: () => {
+            showWatchBar('找到了，就是这张（蓝圈已标出）', 'hit');
+            hideWatchBar(4000);
+        },
+        onTimeout: () => {
+            showWatchBar('两分钟没翻到这张卡片，多半是消息太旧、还没被加载出来', 'miss');
+            hideWatchBar(9000);
+        }
+    });
+
     if (autoClose) closePanel();
-    showFloatingToast(
-        watching
-            ? `已切到「${card.peerName || '聊天'}」，往上翻一点，看到这张卡片我会圈出来`
-            : `已切到「${card.peerName || '聊天'}」，卡片不在当前这一屏，往上翻翻`
-    );
+
+    if (watching) {
+        showWatchBar(`正在盯着「${card.peerName || '聊天'}」· 往上翻到这张卡片，我会立刻圈出来`);
+    } else {
+        showWatchBar(`已切到「${card.peerName || '聊天'}」，但没能开始盯梢，往上翻翻看`, 'miss');
+        hideWatchBar(6000);
+    }
     return false;
 }
 
@@ -1525,7 +1541,7 @@ function stopCardWatch() {
 
 /**
  * @param {object} card 目标卡片
- * @param {object} opts { open: 找到后是否自动点开, timeout: 毫秒 }
+ * @param {object} opts { open: 找到后是否自动点开, timeout: 毫秒, onHit, onTimeout }
  * @returns {boolean} 是否成功挂上
  */
 function watchCardInChat(card, opts) {
@@ -1536,20 +1552,27 @@ function watchCardInChat(card, opts) {
 
     const openAfter = !!(opts && opts.open);
     const life = (opts && opts.timeout) || 120000;
+    const onHit = opts && opts.onHit;
+    const onTimeout = opts && opts.onTimeout;
     let stopped = false;
 
     const tick = () => {
         if (stopped) return;
-        const root = chatRoot();
-        if (!root) return;
-        const hit = searchCardIn(root, card, needles);
-        if (!hit) return;
+        try {
+            const root = chatRoot();
+            if (!root) return;
+            const hit = searchCardIn(root, card, needles);
+            if (!hit) return;
 
-        stop();
-        highlightLocated(hit.el);
-        showFloatingToast(openAfter ? '找到了，正在打开原卡片…' : '找到了，就是这张');
-        if (openAfter) setTimeout(() => clickCardNode(hit.el), 400);
-        diag('[locate] 观察者命中');
+            stop();
+            highlightLocated(hit.el);
+            if (typeof onHit === 'function') onHit(hit.el);
+            else showFloatingToast(openAfter ? '找到了，正在打开原卡片…' : '找到了，就是这张');
+            if (openAfter) setTimeout(() => clickCardNode(hit.el), 400);
+            diag('[locate] 观察者命中');
+        } catch (err) {
+            diag('[locate] tick 异常 ' + err);
+        }
     };
 
     let debounceTimer = null;
@@ -1568,7 +1591,16 @@ function watchCardInChat(card, opts) {
     } catch (_) { /* 观察不了就靠定时器 */ }
 
     const iv = setInterval(tick, 900);
-    const timeout = setTimeout(() => stop(), life);
+    const timeout = setTimeout(() => {
+        stop();
+        if (typeof onTimeout === 'function') {
+            try {
+                onTimeout();
+            } catch (err) {
+                diag('[locate] onTimeout 异常 ' + err);
+            }
+        }
+    }, life);
 
     function stop() {
         if (stopped) return;
@@ -1645,6 +1677,83 @@ function showFloatingToast(message) {
     }
 }
 
+/* ------------------------------------------------------------------
+ * 盯梢状态条
+ * ------------------------------------------------------------------
+ * 点完"定位"之后弹窗必须收起来：遮罩盖在聊天区上，不收起来滚轮就用不了。
+ * 但之前是"收起来 + 2.8 秒 toast"，用户看到的就是弹窗凭空消失，
+ * 以为插件崩了。所以换成一条常驻状态条：
+ *   - 一直显示现在在等什么（往上翻到卡片我就圈出来）
+ *   - 有"取消"，随时能停
+ *   - 有"回到搜索结果"，不用重新搜一遍
+ * 状态条本身 pointer-events: none，只有按钮能点，不挡滚轮。
+ * ------------------------------------------------------------------ */
+
+let watchBarEl = null;
+let watchBarTimer = null;
+
+function ensureWatchBar() {
+    if (watchBarEl && document.body.contains(watchBarEl)) return watchBarEl;
+
+    const bar = document.createElement('div');
+    bar.className = 'fs-root fs-watchbar';
+    bar.setAttribute('data-fs-theme', detectThemeFromDom());
+    bar.innerHTML = `
+        <span class="fs-watchdot"></span>
+        <span class="fs-watchtext"></span>
+        <button type="button" class="fs-watchbtn fs-watch-back">回到搜索结果</button>
+        <button type="button" class="fs-watchbtn fs-watch-cancel">取消</button>`;
+
+    bar.querySelector('.fs-watch-cancel').addEventListener('click', (e) => {
+        e.stopPropagation();
+        stopCardWatch();
+        hideWatchBar();
+        showFloatingToast('已停止定位');
+    });
+
+    bar.querySelector('.fs-watch-back').addEventListener('click', (e) => {
+        e.stopPropagation();
+        stopCardWatch();
+        hideWatchBar();
+        openPanel();
+    });
+
+    document.body.appendChild(bar);
+    watchBarEl = bar;
+    return bar;
+}
+
+/**
+ * @param {string} text 状态文案
+ * @param {string} tone '' | 'hit' | 'miss'
+ */
+function showWatchBar(text, tone) {
+    try {
+        const bar = ensureWatchBar();
+        bar.classList.toggle('is-hit', tone === 'hit');
+        bar.classList.toggle('is-miss', tone === 'miss');
+        bar.querySelector('.fs-watchtext').textContent = text;
+        bar.classList.add('is-show');
+        if (watchBarTimer) {
+            clearTimeout(watchBarTimer);
+            watchBarTimer = null;
+        }
+    } catch (_) { /* 状态条画不出来不影响主流程 */ }
+}
+
+/** @param {number} delay 毫秒；给了就过一会儿自动收起 */
+function hideWatchBar(delay) {
+    if (watchBarTimer) {
+        clearTimeout(watchBarTimer);
+        watchBarTimer = null;
+    }
+    const doHide = () => {
+        if (watchBarEl) watchBarEl.classList.remove('is-show');
+    };
+    if (delay && delay > 0) watchBarTimer = setTimeout(doHide, delay);
+    else doHide();
+}
+
 /**
  * 打开原卡片：定位到它，然后替用户点一下——
  * QQ 会弹出原生的"聊天记录"窗口，里面的图片、文件、表情都在。
@@ -1655,18 +1764,32 @@ async function openOriginalCard(card) {
     if (el) {
         await sleep(400);
         clickCardNode(el);
-        showFloatingToast('已打开原卡片，图片在里面');
-        setTimeout(() => closePanel(), 200);
+        if (card && card.peerName) closePanel();
+        showWatchBar('已替你点开原卡片，QQ 的聊天记录窗口里能看到图片和文件', 'hit');
+        hideWatchBar(4500);
         return true;
     }
 
-    const watching = watchCardInChat(card, { open: true });
+    const watching = watchCardInChat(card, {
+        open: true,
+        onHit: () => {
+            showWatchBar('找到了，正在替你打开原卡片…', 'hit');
+            hideWatchBar(4500);
+        },
+        onTimeout: () => {
+            showWatchBar('两分钟没翻到这张卡片，多半是消息太旧、还没被加载出来', 'miss');
+            hideWatchBar(9000);
+        }
+    });
+
     if (watching) {
-        closePanel();
-        showFloatingToast(`往上翻到「${card.title || '这张卡片'}」，我会自动帮你打开`);
+        if (card && card.peerName) closePanel();
+        showWatchBar(`往上翻到「${card.title || '这张卡片'}」，我会自动帮你打开原卡片`);
         return true;
     }
-    toast('没能在聊天里定位到这张卡片');
+
+    showWatchBar('没能在聊天里定位到这张卡片', 'miss');
+    hideWatchBar(6000);
     return false;
 }
 
@@ -1761,7 +1884,8 @@ function renderDetail() {
                 <button class="fs-btn fs-act-locate">在聊天里定位这条</button>
                 <button class="fs-btn fs-btn-ghost fs-act-open">打开原卡片</button>
             </div>
-            <div class="fs-detail-tip">图片、文件、表情只在 QQ 原卡片里显示，点上面两个按钮就能回到原消息。</div>
+            <div class="fs-detail-tip">图片、文件、表情只在 QQ 原卡片里显示。<br/>
+                点上面的按钮会切到聊天并收起这个弹窗（不然它挡住滚轮），底部会留一条状态条——上面有「回到搜索结果」。</div>
             <div class="fs-detail-list">${innerHtml}</div>
             <div class="fs-foot">
                 <a class="fs-link fs-act-back">← 返回搜索结果</a>
@@ -1812,9 +1936,15 @@ function renderDetail() {
 /**
  * 只补当前这一张（用户正等着看，所以给的时间预算比批量补全短）。
  * __filling 这个标记很重要：没有它，renderDetail 和 fillThisCard 会互相触发成死循环。
+ *
+ * innerFailed 是为了避免"每次打开都往内核打 5 个必失败的请求"：
+ * 9.9.31 上 getMultiMsg 会被服务端拒，用户点十次结果就打五十次。
+ * 只在本次运行里记住，重启后还会再试一次，不写死。
  */
+const innerFailed = new Set();
+
 async function fillThisCard(card) {
-    if (card.__filling) return;
+    if (!card || card.__filling || innerFailed.has(card.id)) return;
     card.__filling = true;
     renderDetail();
     try {
@@ -1825,10 +1955,12 @@ async function fillThisCard(card) {
             card.innerState = 1;
         } else {
             card.innerState = 2;
+            innerFailed.add(card.id);
         }
     } catch (_) {
         /* 补不到就算了，界面上已经有降级提示 */
         card.innerState = 2;
+        innerFailed.add(card.id);
     } finally {
         card.__filling = false;
         if (STATE.currentCard && STATE.currentCard.id === card.id && STATE.mode === 'detail') {
