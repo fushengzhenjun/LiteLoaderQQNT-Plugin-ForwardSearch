@@ -61,7 +61,11 @@ const STATE = {
     searching: false,
     error: '',
     config: null,
-    currentCard: null
+    currentCard: null,
+    // 检索范围：current = 只看眼下打开的这个会话，all = 全部会话
+    scope: 'current',
+    // 上一次搜索实际用的范围，用来判断"当前会话没结果"要不要提示切全部
+    scopeUsed: 'current'
 };
 
 /** 把 HTML 特殊字符转义，防止卡片里的文字把界面结构搞坏 */
@@ -930,6 +934,17 @@ function buildUi() {
                 <input class="fs-input" type="text" spellcheck="false" placeholder="搜索合并转发卡片里的内容…" />
                 <span class="fs-hotkey"></span>
             </div>
+            <div class="fs-scope">
+                <button class="fs-scope-btn" type="button" data-scope="current"></button>
+                <button class="fs-scope-btn" type="button" data-scope="all">全部会话</button>
+                <span class="fs-scope-spacer"></span>
+                <span class="fs-scope-count"></span>
+            </div>
+            <div class="fs-dock-head">
+                <span class="fs-dock-dot"></span>
+                <span class="fs-dock-text"></span>
+                <button class="fs-dock-expand" type="button">展开</button>
+            </div>
             <div class="fs-body"></div>
             <div class="fs-foot">
                 <span class="fs-foot-stat"></span>
@@ -999,7 +1014,42 @@ function buildUi() {
         await scanHistory(200);
     });
 
-    ui = { mask, panel: mask.querySelector('.fs-panel'), input, body };
+    // 检索范围：默认跟着眼下打开的这个会话，也可以切成全部会话
+    const scope = mask.querySelector('.fs-scope');
+    scope.querySelectorAll('.fs-scope-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const next = btn.dataset.scope;
+            if (btn.disabled || STATE.scope === next) return;
+            STATE.scope = next;
+            renderScopeBar();
+            if (STATE.query) doSearch();
+            input.focus();
+        });
+    });
+
+    // 停靠状态下的"展开"，回到大面板继续搜
+    const dockHead = mask.querySelector('.fs-dock-head');
+    dockHead.querySelector('.fs-dock-expand').addEventListener('click', () => undockPanel());
+
+    // 停靠时焦点往往不在输入框上，Esc / 回车 / 上下键得在文档级兜住
+    document.addEventListener('keydown', (e) => {
+        if (!STATE.open || !isDocked()) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            closePanel();
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            openActive();
+        } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            moveActive(1);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            moveActive(-1);
+        }
+    });
+
+    ui = { mask, panel: mask.querySelector('.fs-panel'), input, body, scope, dockHead };
     return ui;
 }
 
@@ -1013,6 +1063,8 @@ async function openPanel() {
         renderOnboard();
     } else {
         STATE.mode = 'search';
+        ui.mask.classList.remove('is-docked');
+        renderScopeBar();
         renderResultsArea();
         if (STATE.query) doSearch();
     }
@@ -1034,10 +1086,91 @@ async function openPanel() {
 function closePanel() {
     if (!ui) return;
     ui.mask.style.display = 'none';
+    ui.mask.classList.remove('is-docked');
     STATE.open = false;
     STATE.mode = 'search';
     // 关键词和结果留着：定位完想再搜同一条时，不用重敲一遍
     // （以前这里会把 query 清空，导致"回到搜索结果"没东西可回）
+}
+
+/* ---------- 检索范围：当前会话 / 全部会话 ---------- */
+
+function renderScopeBar() {
+    if (!ui || !ui.scope) return;
+
+    const peer = currentPeer();
+    const curBtn = ui.scope.querySelector('[data-scope="current"]');
+    const allBtn = ui.scope.querySelector('[data-scope="all"]');
+    if (!curBtn || !allBtn) return;
+
+    if (!peer) {
+        // 右侧还是"选个会话"的空白页，"当前会话"就没有意义了
+        if (STATE.scope === 'current') STATE.scope = 'all';
+        curBtn.disabled = true;
+        curBtn.innerHTML = '<span class="fs-scope-name">当前会话</span>';
+        curBtn.title = '先在 QQ 里打开一个聊天，才能只搜那个会话';
+    } else {
+        curBtn.disabled = false;
+        curBtn.innerHTML =
+            `<span class="fs-scope-dot" style="background:${peerColor(peer.peerUid)}"></span>` +
+            `<span class="fs-scope-name">${esc(shortName(peer.name || '当前会话'))}</span>`;
+        curBtn.title = `只搜这个会话：${peer.name || peer.peerUid}`;
+    }
+
+    curBtn.classList.toggle('is-on', STATE.scope === 'current');
+    allBtn.classList.toggle('is-on', STATE.scope === 'all');
+
+    updateScopeCount();
+}
+
+function updateScopeCount() {
+    if (!ui || !ui.scope) return;
+    const box = ui.scope.querySelector('.fs-scope-count');
+    if (!box) return;
+    if (STATE.searching) {
+        box.textContent = '搜索中…';
+        return;
+    }
+    if (!STATE.query || !STATE.results.length) {
+        box.textContent = '';
+        return;
+    }
+    box.textContent = STATE.scopeUsed === 'current' ? `本会话 ${STATE.results.length} 条` : `${STATE.results.length} 条`;
+}
+
+/* ---------- 传送后停靠 ----------
+ * 传送到位之后不再"啪"一下把面板关掉：缩到右下角停着，把聊天区让出来，
+ * 但搜索结果还在，可以接着点下一条。要关就 Esc，要还原就点「展开」。
+ */
+function dockPanel(note) {
+    if (!ui) return;
+
+    STATE.mode = 'search';
+    STATE.open = true;
+    ui.mask.classList.add('is-docked');
+
+    const text = ui.dockHead && ui.dockHead.querySelector('.fs-dock-text');
+    const dot = ui.dockHead && ui.dockHead.querySelector('.fs-dock-dot');
+    const peer = currentPeer();
+
+    if (text) text.textContent = note || (peer ? `已传送到「${peer.name || peer.peerUid}」` : '已传送');
+    if (dot) dot.style.background = peer ? peerColor(peer.peerUid) : 'var(--fs-accent)';
+
+    renderScopeBar();
+    renderResultsArea();
+}
+
+function undockPanel() {
+    if (!ui) return;
+    ui.mask.classList.remove('is-docked');
+    STATE.open = true;
+    renderScopeBar();
+    renderResultsArea();
+    setTimeout(() => ui.input.focus(), 30);
+}
+
+function isDocked() {
+    return !!(ui && ui.mask.classList.contains('is-docked'));
 }
 
 /* ---------- 各区域的渲染 ---------- */
@@ -1045,6 +1178,7 @@ function closePanel() {
 function renderResultsArea() {
     if (!ui) return;
     const body = ui.body;
+    updateScopeCount();
 
     if (STATE.mode === 'detail') return renderDetail();
     if (STATE.mode === 'onboard') return renderOnboard();
@@ -1122,6 +1256,28 @@ function renderResultsArea() {
     }
 
     if (STATE.results.length === 0) {
+        const peer = currentPeer();
+
+        // 只搜了当前会话却没结果：直接给一个"去全部会话找找"的出口
+        if (STATE.scopeUsed === 'current' && peer) {
+            body.innerHTML = `
+            <div class="fs-state">
+                <strong>「${esc(shortName(peer.name || '这个会话', 18))}」里没有找到</strong>
+                这个会话里没收录到匹配的卡片。换个词，或者去别的会话找找。
+                <div><button class="fs-btn fs-act-allscope">搜全部会话</button></div>
+                <div class="fs-hint">索引里只有你打开过、或别人发来时被动存下来的卡片。</div>
+            </div>`;
+            const allBtn2 = body.querySelector('.fs-act-allscope');
+            if (allBtn2) {
+                allBtn2.addEventListener('click', () => {
+                    STATE.scope = 'all';
+                    renderScopeBar();
+                    doSearch();
+                });
+            }
+            return;
+        }
+
         body.innerHTML = `
             <div class="fs-state">
                 <strong>没有找到匹配的卡片</strong>
@@ -1134,18 +1290,27 @@ function renderResultsArea() {
         return;
     }
 
+    const peerNow = currentPeer();
     body.innerHTML = STATE.results
         .map((card, i) => {
             const active = i === STATE.activeIndex ? ' is-active' : '';
             const countBadge = card.count > 0 ? `<span class="fs-badge">共 ${card.count} 条</span>` : '';
             const pending = card.innerState === 0 ? '<span class="fs-badge" style="opacity:.6">内容未补全</span>' : '';
+
+            // 每个群一个固定颜色 + 首字，多个群混在一起时一眼能分清是哪一个
+            const hue = peerHue(card.peerUid);
+            const initial = (card.peerName || '群').trim().slice(0, 1);
+            const isHere = !!(peerNow && String(card.peerUid) === peerNow.peerUid);
+            const hereTag = isHere ? '<span class="fs-badge-here">当前</span>' : '';
+
             return `
-                <div class="fs-item${active}" data-index="${i}">
+                <div class="fs-item${active}${isHere ? ' is-here' : ''}" data-index="${i}">
                     <div class="fs-item-head">
+                        <span class="fs-item-avatar" style="--h:${hue}">${esc(initial)}</span>
                         <span class="fs-item-group">${esc(card.peerName || '未知群聊')}</span>
                         <span class="fs-dot"></span>
                         <span class="fs-item-time">${formatTime(card.msgTime)}</span>
-                        ${countBadge}${pending}
+                        ${hereTag}${countBadge}${pending}
                     </div>
                     <div class="fs-item-title">${highlight(card.title || '聊天记录', STATE.query)}</div>
                     <div class="fs-item-preview">${highlight(card.preview || '（无摘要）', STATE.query)}</div>
@@ -1204,8 +1369,17 @@ async function doSearch() {
     STATE.searching = true;
     renderResultsArea();
 
+    // 范围：默认只看眼下这个会话，用户切到"全部会话"才搜全库
+    const peer = currentPeer();
+    const scoped = STATE.scope === 'current' && peer ? peer.peerUid : '';
+    STATE.scopeUsed = scoped ? 'current' : 'all';
+
     try {
-        const res = await bridge.search(STATE.query, (STATE.config && STATE.config.maxResults) || 60);
+        const res = await bridge.search(
+            STATE.query,
+            (STATE.config && STATE.config.maxResults) || 60,
+            scoped
+        );
         if (!res || !res.ok) {
             throw new Error((res && res.error) || '搜索失败');
         }
@@ -1332,6 +1506,46 @@ function currentAioUid(ctx) {
     const c = ctx || aioCtx();
     if (!c || !c.curAioData || !c.curAioData.header) return '';
     return String(c.curAioData.header.uid || '');
+}
+
+/**
+ * 眼下打开的是哪个会话。
+ * 群的 peerUid 就是群号，好友是 u_xxx，跟索引里存的 peerUid 是同一套值。
+ * 没打开会话（右侧还是"选个会话"的空白页）时返回 null。
+ */
+function currentPeer() {
+    const ctx = aioCtx();
+    if (!ctx || !ctx.curAioData || !ctx.curAioData.header) return null;
+
+    const h = ctx.curAioData.header;
+    const uid = String(h.uid || '');
+    if (!uid) return null;
+
+    return {
+        peerUid: uid,
+        chatType: Number(ctx.curAioData.chatType) || 1,
+        name: String(h.peerName || h.remark || ''),
+        uin: String(h.uin || '')
+    };
+}
+
+/** 由会话 id 生成一个稳定色相，同一个群永远是同一个颜色 */
+function peerHue(peerUid) {
+    const s = String(peerUid || '');
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+    return h;
+}
+
+function peerColor(peerUid) {
+    return `hsl(${peerHue(peerUid)} 58% 50%)`;
+}
+
+/** 群名太长时截一下，别把头部撑爆 */
+function shortName(name, max = 14) {
+    const s = String(name || '');
+    if (s.length <= max) return s;
+    return s.slice(0, max) + '…';
 }
 
 /**
@@ -1515,7 +1729,8 @@ async function tryJumpToChat(card, opts) {
     // 不再退回滚轮——"消息不在了"这种情况，翻几十屏也翻不出来。
     if (aioCtx()) {
         if (await directJumpToCard(card)) {
-            if (autoClose) setTimeout(() => closePanel(), 260);
+            // 传送到了就停靠在角落，不把面板收走——还想点下一条随时能点
+            if (autoClose) dockPanel(`已传送到「${(currentPeer() && currentPeer().name) || card.peerName || '聊天'}」`);
             showWatchBar('已传送到这张卡片（蓝圈标出，往上一点就是它）', 'hit');
             hideWatchBar(4200);
             return true;
@@ -1549,7 +1764,7 @@ async function tryJumpToChat(card, opts) {
 
     if (node) {
         jumpNotice = '';
-        if (autoClose) setTimeout(() => closePanel(), 300);
+        if (autoClose) setTimeout(() => dockPanel(), 300);
         showWatchBar('已定位到这张卡片（蓝圈就在聊天区），圈 2.6 秒后自动消失', 'hit');
         hideWatchBar(4000);
         return true;
@@ -1557,7 +1772,7 @@ async function tryJumpToChat(card, opts) {
 
     // 3. 不在这一屏：先收起弹窗（遮罩会挡滚轮），然后让主进程替你往上翻。
     //    这是唯一能真正把人送到卡片的方式——QQ 的列表只认真实滚轮。
-    if (autoClose) closePanel();
+    if (autoClose) dockPanel();
     showWatchBar(`正在替你往上翻「${card.peerName || '聊天'}」，找到就圈出来…`);
     node = await autoScrollToCard(card, {
         budget: 25000,
@@ -2180,7 +2395,7 @@ async function openOriginalCard(card) {
         if (canDirect && (await directJumpToCard(card))) {
             el = locateCardInView(card);
         } else if (canDirect) {
-            closePanel();
+            dockPanel();
             showWatchBar('聊天记录里找不到这条消息了，可能已被撤回或删除', 'miss');
             hideWatchBar(8000);
             return false;
@@ -2189,7 +2404,7 @@ async function openOriginalCard(card) {
 
     // 直达接口拿不到（QQ 改版）才退回老办法：往上翻，翻到了再点开
     if (!el) {
-        if (card && card.peerName) closePanel();
+        if (card && card.peerName) dockPanel();
         showWatchBar('正在传送，找到后自动打开原卡片…');
         el = await autoScrollToCard(card, {
             budget: 25000,
@@ -2201,7 +2416,7 @@ async function openOriginalCard(card) {
     if (el) {
         await sleep(400);
         clickCardNode(el);
-        if (card && card.peerName) closePanel();
+        if (card && card.peerName) dockPanel();
         showWatchBar('已替你点开原卡片，QQ 的聊天记录窗口里能看到图片和文件', 'hit');
         hideWatchBar(4500);
         return true;
@@ -2220,7 +2435,7 @@ async function openOriginalCard(card) {
     });
 
     if (watching) {
-        if (card && card.peerName) closePanel();
+        if (card && card.peerName) dockPanel();
         showWatchBar(`往上翻到「${card.title || '这张卡片'}」，我会自动帮你打开原卡片`);
         return true;
     }

@@ -182,12 +182,16 @@ class CardStore {
      * 检索。
      * 规则：空格分隔的多个词必须全部命中（AND）；标题/群名命中排在内容命中前面。
      */
-    search(query, limit = 60) {
+    search(query, limit = 60, peerUid = '') {
         const terms = normalize(query).split(' ').filter(Boolean);
         if (terms.length === 0) return [];
+        const onlyPeer = peerUid ? String(peerUid) : '';
 
         const hits = [];
         for (const rec of this.records) {
+            // 只看某个会话时先按会话过滤：这样 limit 不会被别的群占满
+            if (onlyPeer && String(rec.peerUid) !== onlyPeer) continue;
+
             const text = rec._search || '';
             let ok = true;
             for (const t of terms) {
