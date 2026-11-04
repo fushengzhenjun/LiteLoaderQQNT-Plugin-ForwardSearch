@@ -181,8 +181,9 @@ class CardStore {
     /**
      * 检索。
      * 规则：空格分隔的多个词必须全部命中（AND）；标题/群名命中排在内容命中前面。
+     * sortBy：'relevance'（默认，按相关度打分）或 'time'（纯按时间倒序）。
      */
-    search(query, limit = 60, peerUid = '') {
+    search(query, limit = 60, peerUid = '', sortBy = 'relevance') {
         const terms = normalize(query).split(' ').filter(Boolean);
         if (terms.length === 0) return [];
         const onlyPeer = peerUid ? String(peerUid) : '';
@@ -214,10 +215,15 @@ class CardStore {
             hits.push({ rec, score });
         }
 
-        hits.sort((a, b) => {
-            if (b.score !== a.score) return b.score - a.score;
-            return (b.rec.msgTime || 0) - (a.rec.msgTime || 0);
-        });
+        if (sortBy === 'time') {
+            // 纯时间倒序：最新的在最上面
+            hits.sort((a, b) => (b.rec.msgTime || 0) - (a.rec.msgTime || 0));
+        } else {
+            hits.sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return (b.rec.msgTime || 0) - (a.rec.msgTime || 0);
+            });
+        }
 
         return hits.slice(0, limit).map((h) => strip(h.rec));
     }

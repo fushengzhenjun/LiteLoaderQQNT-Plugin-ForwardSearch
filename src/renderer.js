@@ -65,7 +65,9 @@ const STATE = {
     // 检索范围：current = 只看眼下打开的这个会话，all = 全部会话
     scope: 'current',
     // 上一次搜索实际用的范围，用来判断"当前会话没结果"要不要提示切全部
-    scopeUsed: 'current'
+    scopeUsed: 'current',
+    // 排序方式：relevance = 相关度（默认），time = 按时间
+    sortBy: 'relevance'
 };
 
 /** 把 HTML 特殊字符转义，防止卡片里的文字把界面结构搞坏 */
@@ -946,6 +948,8 @@ function buildUi() {
                 <button class="fs-scope-btn" type="button" data-scope="current"></button>
                 <button class="fs-scope-btn" type="button" data-scope="all">全部会话</button>
                 <span class="fs-scope-spacer"></span>
+                <button class="fs-sort-btn" type="button" data-sort="relevance">相关度</button>
+                <button class="fs-sort-btn" type="button" data-sort="time">按时间</button>
                 <span class="fs-scope-count"></span>
             </div>
             <div class="fs-dock-head">
@@ -1040,6 +1044,18 @@ function buildUi() {
             const next = btn.dataset.scope;
             if (btn.disabled || STATE.scope === next) return;
             STATE.scope = next;
+            renderScopeBar();
+            if (STATE.query) doSearch();
+            input.focus();
+        });
+    });
+
+    // 排序：相关度 / 按时间
+    scope.querySelectorAll('.fs-sort-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const next = btn.dataset.sort;
+            if (STATE.sortBy === next) return;
+            STATE.sortBy = next;
             renderScopeBar();
             if (STATE.query) doSearch();
             input.focus();
@@ -1209,6 +1225,11 @@ function renderScopeBar() {
 
     curBtn.classList.toggle('is-on', STATE.scope === 'current');
     allBtn.classList.toggle('is-on', STATE.scope === 'all');
+
+    // 排序按钮高亮
+    ui.scope.querySelectorAll('.fs-sort-btn').forEach((btn) => {
+        btn.classList.toggle('is-on', btn.dataset.sort === STATE.sortBy);
+    });
 
     updateScopeCount();
 }
@@ -1474,7 +1495,8 @@ async function doSearch() {
         const res = await bridge.search(
             STATE.query,
             (STATE.config && STATE.config.maxResults) || 60,
-            scoped
+            scoped,
+            STATE.sortBy
         );
         if (!res || !res.ok) {
             throw new Error((res && res.error) || '搜索失败');

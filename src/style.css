@@ -373,6 +373,36 @@
     flex: 1 1 auto;
 }
 
+/* 排序：相关度 / 按时间，跟范围按钮同款胶囊，放最右侧 */
+.fs-sort-btn {
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 11px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--fs-text-weak);
+    font: inherit;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.14s, color 0.14s, border-color 0.14s;
+}
+
+.fs-sort-btn:hover {
+    background: var(--fs-bg-hover);
+    color: var(--fs-text);
+}
+
+.fs-sort-btn.is-on {
+    background: var(--fs-accent-soft);
+    border-color: var(--fs-accent-soft);
+    color: var(--fs-accent);
+    font-weight: 600;
+}
+
 .fs-scope-count {
     font-size: 11.5px;
     color: var(--fs-text-weak);
@@ -471,6 +501,12 @@
 
 .fs-mask.is-docked .fs-scope {
     padding: 7px 12px;
+}
+
+.fs-mask.is-docked .fs-sort-btn {
+    height: 22px;
+    padding: 0 8px;
+    font-size: 11px;
 }
 
 .fs-mask.is-docked .fs-foot {
