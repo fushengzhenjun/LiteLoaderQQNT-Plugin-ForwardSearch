@@ -926,6 +926,14 @@ function buildUi() {
     mask.style.display = 'none';
     mask.innerHTML = `
         <div class="fs-panel" role="dialog" aria-label="合并转发搜索">
+            <div class="fs-titlebar">
+                <span class="fs-titlebar-name">合并转发搜索</span>
+                <button class="fs-titlebar-close" type="button" title="关闭" aria-label="关闭">
+                    <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M4 4L12 12M12 4L4 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
             <div class="fs-search">
                 <svg class="fs-search-icon" viewBox="0 0 16 16" fill="none">
                     <circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.6"/>
@@ -961,6 +969,17 @@ function buildUi() {
 
     const input = mask.querySelector('.fs-input');
     const body = mask.querySelector('.fs-body');
+    const panel = mask.querySelector('.fs-panel');
+    const titlebar = mask.querySelector('.fs-titlebar');
+
+    // 标题栏右上角的关闭按钮：跟 Esc / 点遮罩一样，直接关掉
+    mask.querySelector('.fs-titlebar-close').addEventListener('click', (e) => {
+        e.stopPropagation();
+        closePanel();
+    });
+
+    // 拖动标题栏移动面板（在遮罩内自由摆放，松手停住，位置不重置）
+    makeDraggable(panel, titlebar);
 
     // 搜索框右边那个小胶囊显示当前快捷键，提醒用户下次可以直接按
     const hotkeyTip = mask.querySelector('.fs-hotkey');
@@ -1049,8 +1068,72 @@ function buildUi() {
         }
     });
 
-    ui = { mask, panel: mask.querySelector('.fs-panel'), input, body, scope, dockHead };
+    ui = { mask, panel, input, body, scope, dockHead };
     return ui;
+}
+
+/* ---------- 面板拖动 ----------
+ * 按住标题栏拖动，面板在遮罩内自由移动；松手就停在当前位置，不自动回中。
+ * 用 pointer 事件 + setPointerCapture，比 mouse 事件更稳，也兼容触摸。
+ */
+function makeDraggable(panel, handle) {
+    if (!panel || !handle) return;
+
+    handle.addEventListener('pointerdown', (e) => {
+        // 点的是关闭按钮就不拖（关闭按钮在标题栏里）
+        if (e.target && e.target.closest('.fs-titlebar-close')) return;
+
+        e.preventDefault();
+        const mask = panel.parentElement;
+        if (!mask) return;
+
+        // 记下拖动起点：面板当前左上角（未定位时按当前可视位置算）
+        let baseLeft = panel.offsetLeft;
+        let baseTop = panel.offsetTop;
+        if (!mask.classList.contains('fs-panel-dragging')) {
+            // 首次拖动：把面板从 flex 居中切到绝对定位，并锁定当前位置
+            const pr = panel.getBoundingClientRect();
+            const mr = mask.getBoundingClientRect();
+            baseLeft = pr.left - mr.left;
+            baseTop = pr.top - mr.top;
+            mask.classList.add('fs-panel-dragging');
+        }
+
+        const startX = e.clientX;
+        const startY = e.clientY;
+
+        const onMove = (ev) => {
+            const dx = ev.clientX - startX;
+            const dy = ev.clientY - startY;
+            let left = baseLeft + dx;
+            let top = baseTop + dy;
+
+            // 不让面板被拖出可视区域
+            const pw = panel.offsetWidth;
+            const ph = panel.offsetHeight;
+            const mw = mask.clientWidth;
+            const mh = mask.clientHeight;
+            left = Math.max(0, Math.min(left, mw - pw));
+            top = Math.max(0, Math.min(top, mh - ph));
+
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
+        };
+
+        const onUp = () => {
+            handle.removeEventListener('pointermove', onMove);
+            handle.removeEventListener('pointerup', onUp);
+            handle.removeEventListener('pointercancel', onUp);
+            if (handle.releasePointerCapture) {
+                try { handle.releasePointerCapture(e.pointerId); } catch (_) {}
+            }
+        };
+
+        try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+        handle.addEventListener('pointercancel', onUp);
+    });
 }
 
 /** 打开弹窗（异步：样式表要从主进程取） */
@@ -1067,6 +1150,13 @@ async function openPanel() {
         renderScopeBar();
         renderResultsArea();
         if (STATE.query) doSearch();
+    }
+
+    // 重置拖动状态：每次打开都回到居中，不带上次拖动的位置
+    ui.mask.classList.remove('fs-panel-dragging');
+    if (ui.panel) {
+        ui.panel.style.left = '';
+        ui.panel.style.top = '';
     }
 
     // 排障用：config 里写了 debugAutoQuery 就自动填好关键词并搜一次，
@@ -1147,6 +1237,12 @@ function dockPanel(note) {
 
     STATE.mode = 'search';
     STATE.open = true;
+    // 停靠前清掉拖动残留，让停靠条用 flex 正常摆到右下角
+    ui.mask.classList.remove('fs-panel-dragging');
+    if (ui.panel) {
+        ui.panel.style.left = '';
+        ui.panel.style.top = '';
+    }
     ui.mask.classList.add('is-docked');
 
     const text = ui.dockHead && ui.dockHead.querySelector('.fs-dock-text');

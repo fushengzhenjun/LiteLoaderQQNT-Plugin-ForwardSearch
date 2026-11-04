@@ -207,6 +207,74 @@
     to { transform: none; opacity: 1; }
 }
 
+/* ---------- 标题栏（可拖动 + 关闭按钮） ---------- */
+
+.fs-titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 12px 9px 18px;
+    border-bottom: 1px solid var(--fs-border);
+    cursor: grab;
+    user-select: none;
+    -webkit-app-region: no-drag;
+    flex: 0 0 auto;
+}
+
+.fs-titlebar:active {
+    cursor: grabbing;
+}
+
+.fs-titlebar-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fs-text-sub);
+    letter-spacing: 0.2px;
+}
+
+.fs-titlebar-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fs-text-weak);
+    cursor: pointer;
+    flex: 0 0 auto;
+    transition: background 0.14s var(--fs-ease), color 0.14s var(--fs-ease);
+}
+
+.fs-titlebar-close svg {
+    width: 15px;
+    height: 15px;
+}
+
+.fs-titlebar-close:hover {
+    background: var(--fs-bg-hover);
+    color: var(--fs-text);
+}
+
+.fs-titlebar-close:active {
+    background: var(--fs-bg-active);
+}
+
+/* 拖动中：面板脱离 flex 居中，改绝对定位，由 JS 直接写 left/top */
+.fs-mask.fs-panel-dragging {
+    align-items: flex-start;
+    justify-content: flex-start;
+}
+
+.fs-mask.fs-panel-dragging .fs-panel {
+    position: absolute;
+    margin: 0;
+    animation: none;
+}
+
 /* ---------- 搜索框 ---------- */
 
 .fs-search {
@@ -353,6 +421,11 @@
     border-bottom: 1px solid var(--fs-border);
     background: var(--fs-bg-sub);
     flex: 0 0 auto;
+}
+
+/* 停靠时收起标题栏，避免跟停靠条重复占地方 */
+.fs-mask.is-docked .fs-titlebar {
+    display: none;
 }
 
 .fs-dock-dot {
