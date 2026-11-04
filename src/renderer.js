@@ -1165,7 +1165,9 @@ async function openPanel() {
         ui.mask.classList.remove('is-docked');
         renderScopeBar();
         renderResultsArea();
+        // 有词就搜，没词就自动铺出最近收录的卡片（按时间倒序）
         if (STATE.query) doSearch();
+        else doListRecent();
     }
 
     // 重置拖动状态：每次打开都回到居中，不带上次拖动的位置
@@ -1242,11 +1244,12 @@ function updateScopeCount() {
         box.textContent = '搜索中…';
         return;
     }
-    if (!STATE.query || !STATE.results.length) {
+    if (!STATE.results.length) {
         box.textContent = '';
         return;
     }
-    box.textContent = STATE.scopeUsed === 'current' ? `本会话 ${STATE.results.length} 条` : `${STATE.results.length} 条`;
+    const prefix = !STATE.query ? '最近 ' : (STATE.scopeUsed === 'current' ? '本会话 ' : '');
+    box.textContent = `${prefix}${STATE.results.length} 条`;
 }
 
 /* ---------- 传送后停靠 ----------
@@ -1354,26 +1357,41 @@ function renderResultsArea() {
             return;
         }
 
-        body.innerHTML = `
-            <div class="fs-state fs-state-empty">
-                <div class="fs-art">
-                    <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
-                        <rect x="10" y="14" width="34" height="26" rx="6" stroke="currentColor" stroke-width="2.2" opacity=".55"/>
-                        <path d="M17 24h20M17 31h13" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity=".38"/>
-                        <circle cx="42" cy="42" r="10" stroke="currentColor" stroke-width="2.4"/>
-                        <path d="M49.5 49.5L56 56" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
-                    </svg>
-                </div>
-                <strong>输入关键词开始找</strong>
-                搜的是整张合并转发卡片，包括卡片里面的聊天内容。<br/>
-                比如搜一句你在转发里看到过的话。
-                <div class="fs-hint">关键词可以用空格分开，表示"同时包含"。</div>
-            </div>`;
-        return;
+        // 有卡片：不再显示"输入关键词"的空页，直接往下走，把最近收录的卡片铺出来
+        // （结果由 doListRecent 填进 STATE.results，按时间倒序）
     }
 
     if (STATE.results.length === 0) {
         const peer = currentPeer();
+
+        // 没输入关键词、但当前会话里还没有卡片：提示去全部看看，或者扫描
+        if (!STATE.query) {
+            if (STATE.scopeUsed === 'current' && peer) {
+                body.innerHTML = `
+                <div class="fs-state">
+                    <strong>「${esc(shortName(peer.name || '这个会话', 18))}」里还没有卡片</strong>
+                    这个会话还没收录到合并转发卡片。
+                    <div><button class="fs-btn fs-act-allscope">看全部会话的卡片</button></div>
+                    <div class="fs-hint">也可以回到聊天里，让它先被动收录。</div>
+                </div>`;
+                const allBtn3 = body.querySelector('.fs-act-allscope');
+                if (allBtn3) {
+                    allBtn3.addEventListener('click', () => {
+                        STATE.scope = 'all';
+                        renderScopeBar();
+                        doListRecent();
+                    });
+                }
+            } else {
+                body.innerHTML = `
+                <div class="fs-state">
+                    <strong>还没有卡片</strong>
+                    索引里还没有收录到任何合并转发卡片。
+                    <div class="fs-hint">在 QQ 里打开有合并转发的聊天，卡片会自动收进来；也可以点「扫描历史」。</div>
+                </div>`;
+            }
+            return;
+        }
 
         // 只搜了当前会话却没结果：直接给一个"去全部会话找找"的出口
         if (STATE.scopeUsed === 'current' && peer) {
@@ -1467,12 +1485,57 @@ function openActive() {
  * 6. 搜索
  * ================================================================== */
 
+/** 空查询：自动铺出最近收录的卡片，按时间倒序（最新的在上面） */
+async function doListRecent() {
+    if (!ui) return;
+    STATE.error = '';
+
+    if (!bridge) {
+        STATE.error = '插件桥接层没有加载成功，请重启 QQ 再试。';
+        STATE.searching = false;
+        renderResultsArea();
+        return;
+    }
+
+    // 范围：默认只看眼下这个会话，切"全部会话"才列全库
+    const peer = currentPeer();
+    const scoped = STATE.scope === 'current' && peer ? peer.peerUid : '';
+    STATE.scopeUsed = scoped ? 'current' : 'all';
+
+    STATE.searching = true;
+    renderResultsArea();
+
+    try {
+        const res = await bridge.list(
+            (STATE.config && STATE.config.maxResults) || 100,
+            scoped
+        );
+        if (!res || !res.ok) {
+            throw new Error((res && res.error) || '读取失败');
+        }
+        STATE.results = res.data || [];
+        for (const card of STATE.results) {
+            if ((!card.peerName || card.peerName === card.peerUid) && bridge.getPeerName) {
+                const name = bridge.getPeerName(card.peerUid);
+                if (name) card.peerName = name;
+            }
+        }
+    } catch (err) {
+        STATE.results = [];
+        STATE.error = '读取卡片时出错：' + String((err && err.message) || err);
+    } finally {
+        STATE.searching = false;
+        renderResultsArea();
+    }
+}
+
 async function doSearch() {
     if (!ui) return;
     STATE.error = '';
 
     if (!STATE.query) {
-        renderResultsArea();
+        // 没有关键词：不再显示"输入关键词"的空页，而是自动铺出最近收录的卡片（按时间倒序）
+        await doListRecent();
         return;
     }
 

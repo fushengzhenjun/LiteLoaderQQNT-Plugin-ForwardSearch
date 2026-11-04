@@ -234,6 +234,21 @@ class CardStore {
         return rec ? strip(rec) : null;
     }
 
+    /**
+     * 列出卡片，按时间倒序（最新的在最上面）。
+     * 空查询时用它自动铺出最近收录的卡片，peerUid 给定时只列那个会话。
+     */
+    list(limit = 100, peerUid = '') {
+        const onlyPeer = peerUid ? String(peerUid) : '';
+        const out = [];
+        for (const rec of this.records) {
+            if (onlyPeer && String(rec.peerUid) !== onlyPeer) continue;
+            out.push(rec);
+        }
+        out.sort((a, b) => (b.msgTime || 0) - (a.msgTime || 0));
+        return out.slice(0, limit).map((r) => strip(r));
+    }
+
     /** 更新某条卡片的内部内容 */
     setInner(id, inner, state) {
         const rec = this.byId.get(id);

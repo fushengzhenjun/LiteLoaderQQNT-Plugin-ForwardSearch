@@ -300,6 +300,7 @@ const api = {
     /** 本地索引读写 */
     upsert: (records) => ipcRenderer.invoke('forward-search:upsert', records),
     search: (query, limit, peerUid, sortBy) => ipcRenderer.invoke('forward-search:search', query, limit, peerUid || '', sortBy || 'relevance'),
+    list: (limit, peerUid) => ipcRenderer.invoke('forward-search:list', limit, peerUid || ''),
     getCard: (id) => ipcRenderer.invoke('forward-search:get', id),
     stats: () => ipcRenderer.invoke('forward-search:stats'),
     /** 旁听到的会话列表（扫描历史用） */

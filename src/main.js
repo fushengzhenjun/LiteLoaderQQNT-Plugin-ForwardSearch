@@ -450,6 +450,7 @@ function setupIpc() {
     // ---- 数据 ----
     handle('upsert', (records) => store.upsertMany(records));
     handle('search', (query, limit, peerUid, sortBy) => store.search(query, limit || config.maxResults, peerUid || '', sortBy || 'relevance'));
+    handle('list', (limit, peerUid) => store.list(limit || config.maxResults || 100, peerUid || ''));
     handle('get', (id) => store.get(id));
     handle('stats', () => store.stats());
     handle('peers', () => Array.from(peerMap.values()));
