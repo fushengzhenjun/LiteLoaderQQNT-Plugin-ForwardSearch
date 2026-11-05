@@ -106,42 +106,70 @@ LiteLoaderQQNT 官方 README 里写得很清楚：
 
 **1.1 下载**
 
-去 `https://github.com/LiteLoaderQQNT/LiteLoaderQQNT/releases` 下载 `LiteLoaderQQNT.zip`，解压到一个**以后不会删的文件夹**，比如 `D:\LiteLoaderQQNT`。
+去 `https://github.com/LiteLoaderQQNT/LiteLoaderQQNT/releases/latest` 下载 `LiteLoaderQQNT.zip`，解压到一个**以后不会删的文件夹**，比如 `D:\LiteLoaderQQNT`。
 
-**1.2 找到 QQ 的安装目录**
+> **为什么不能放临时目录**：QQ 启动时要按这个路径去加载，你把文件夹挪走或删掉，QQ 就打不开了。
 
-在 QQ 桌面图标上右键 → 打开文件所在位置。你会看到类似这样的结构：
+**1.2 找到 QQ 的安装目录，先判断结构**
+
+在 QQ 桌面图标上右键 → 打开文件所在位置。
+
+看这个目录下**有没有 `versions` 文件夹**，这决定后面 `app` 在哪：
+
+| 情况 | app 路径 |
+|---|---|
+| **有** `versions` 文件夹 | `QQ安装目录\versions\版本号\resources\app` |
+| **没有** | `QQ安装目录\resources\app` |
+
+结构长这样（版本号每个人不一样）：
 
 ```
 QQ.exe
 versions\
-  └─ 9.9.21-38711\          ← 这个文件夹名字（版本号）每个人不一样
+  └─ 9.9.31-49738\          ← 这个文件夹名字（版本号）每个人不一样
        └─ resources\
             └─ app\
                  ├─ package.json     ← 等下要改这个
                  └─ application.asar
 ```
 
-**1.3 让 QQ 跳过文件校验（Windows 需要）**
+**1.3 绕过 QQ 的文件校验（Windows 必须做）**
 
-LiteLoader 的 release 页面里会说明。简单说：从它提供的渠道拿到 `dbghelp.dll`，重命名后放进 `QQ.exe` 所在的同一个文件夹。
+QQ 会检查自己的文件有没有被改过。不做这一步，改完 `package.json` 后 QQ 直接启动不了。
 
-> 这一步的作用是让 QQ 不再检查自己的文件有没有被改过。没有它，改完 `package.json` QQ 会启动不了。
+做法：拿到 `dbghelp.dll`，放进 **`QQ.exe` 所在的同一个文件夹**。
 
-**1.4 写一个启动文件**
+> ⚠️ **这里有个大坑**：`dbghelp.dll` 分 x64 和 ARM64 两个版本。你的**操作系统架构、QQ 架构、这个 dll** 三者必须一致。
+> 绝大多数人的电脑是 x64，下 `dbghelp_x64.dll`；只有骁龙处理器的笔记本才是 ARM64。
+> 放错了 QQ 会各种异常。
+
+这个 dll 官方没有公开放在 Release 页，需要从 LiteLoaderQQNT 的 **Telegram 群**获取。拿不到的话，用下面 1.3 备选方案里的自动化工具，它会帮你处理。
+
+**1.4 备选：用自动化工具（可跳过 1.5、1.6）**
+
+社区有两个工具能自动完成"绕过校验 + 改入口 + 建启动脚本"，装完直接跳到 1.7 验证：
+
+| 工具 | 说明 |
+|---|---|
+| `QQNTPatcher.exe` | 图形化补丁工具（作者 sysR@M），放在 LiteLoader 目录里运行，一键打补丁 |
+| [LiteLoaderQQNT_Install](https://github.com/Mzdyl/LiteLoaderQQNT_Install) | Python 脚本，Windows / macOS / Linux 通用 |
+
+> 工具也是人写的，QQ 大版本更新后可能失效。失效就回到手动流程。
+
+**1.5 手动：写一个启动文件**
 
 在 `resources\app` 里面新建一个文件夹，叫 `app_launcher`。
 在里面新建一个文本文件，改名为 `LiteLoader.js`（注意：不是 `.txt`）。
 
-用记事本打开它，只写一行——把引号里的路径换成你第 1.1 步解压的位置：
+用记事本打开它，只写一行——把反引号里的路径换成你第 1.1 步解压的位置：
 
 ```js
 require(String.raw`D:\LiteLoaderQQNT`);
 ```
 
-> 注意：是**文件夹**路径，不是某个 js 文件的路径。反引号别丢了。
+> 注意：是**文件夹**路径，不是某个 js 文件的路径。反引号别丢了（就是键盘左上角 Esc 下面那个键）。
 
-**1.5 改 QQ 的入口**
+**1.6 手动：改 QQ 的启动入口**
 
 用记事本打开 `resources\app\package.json`，找到 `"main"` 这一行，改成：
 
@@ -149,10 +177,12 @@ require(String.raw`D:\LiteLoaderQQNT`);
 "main": "./app_launcher/LiteLoader.js"
 ```
 
-**1.6 验证**
+**1.7 验证：加载器装好了吗**
 
 启动 QQ，打开设置，看左侧是不是多了一个 **LiteLoaderQQNT** 的选项。
-有 → 成功了。没有 → 回到 1.3 检查 `dbghelp.dll` 放的位置对不对。
+
+- 有 → 成功了，继续第 2 步
+- 没有 → 按顺序检查：① `dbghelp.dll` 放对位置了吗（要跟 `QQ.exe` 同级）② `package.json` 的 `main` 改对了吗 ③ `LiteLoader.js` 里的路径正确吗
 
 ---
 
@@ -201,6 +231,22 @@ D:\LiteLoaderQQNT\
 看到搜索框弹出来，就成了。
 
 > 如果按了没反应：QQ 设置 → LiteLoaderQQNT → 插件列表，确认 `forward-search` 是启用状态。还不行就看文末「常见问题」。
+
+---
+
+### 第 3 步：让它先认识你的聊天（**别跳过**）
+
+搜框能打开，但这时候**搜什么都是空的**——因为还没收录任何卡片。
+
+做一件事：
+
+1. 在 QQ 里**点开你常聊的那个群**（有合并转发卡片的群）
+2. 打开搜索框，点右下角 **「扫描历史」**
+3. 等它跑完（群里消息多的话要几分钟，可以随时暂停）
+
+跑完之后，这个群的卡片就进索引了。之后**新收到的卡片会自动收录**，不用再手动扫。
+
+> 换一个群搜，就再打开那个群扫一次。这是"被动收录"的代价，详见上面第 1 点。
 
 ---
 
