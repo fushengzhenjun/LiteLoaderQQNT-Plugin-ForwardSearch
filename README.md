@@ -158,7 +158,29 @@ require(String.raw`D:\LiteLoaderQQNT`);
 
 ### 第 2 步：装这个插件
 
-1. 把整个 `forward-search` 文件夹，复制到 LiteLoader 目录下的 `plugins` 文件夹里：
+**2.1 下载**
+
+去 Release 页面下载 `forward-search.zip`：
+
+```
+https://github.com/fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch/releases/latest
+```
+
+> **国内打不开 GitHub 的话**，用加速镜像（永远指向最新版）：
+> ```
+> https://gh-proxy.com/https://github.com/fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch/releases/latest/download/forward-search.zip
+> ```
+> 或者换 `ghfast.top` 前缀：
+> ```
+> https://ghfast.top/https://github.com/fushengzhenjun/LiteLoaderQQNT-Plugin-ForwardSearch/releases/latest/download/forward-search.zip
+> ```
+> 这些是第三方公益加速服务，不保证长期可用。能直连就用直连。
+
+下载完**解压**，会得到一个 `forward-search` 文件夹。
+
+**2.2 放进 plugins 目录**
+
+把整个 `forward-search` 文件夹，复制到 LiteLoader 目录下的 `plugins` 文件夹里：
 
 ```
 D:\LiteLoaderQQNT\
@@ -168,9 +190,13 @@ D:\LiteLoaderQQNT\
             └─ src\
 ```
 
-2. 完全退出 QQ（右下角托盘图标 → 退出，别只是关窗口），再重新打开。
+**2.3 重启 QQ**
 
-3. 在 QQ 里按 **`Alt + S`**。
+完全退出 QQ（右下角托盘图标 → 退出，别只是关窗口），再重新打开。
+
+**2.4 验证**
+
+在 QQ 里按 **`Alt + S`**，或者点主面板顶部的「卡片搜索」按钮。
 
 看到搜索框弹出来，就成了。
 
