@@ -189,7 +189,9 @@
 /* ---------- 主面板 ---------- */
 
 .fs-panel {
-    width: 700px;
+    /* 宽度跟着窗口走：小窗口不至于挤，大窗口 / 高分辨率下也不会显得又窄又空。
+       下限 620 保证列表能放下图标+标题+摘要，上限 880 避免一行拉太长不好读。 */
+    width: clamp(620px, 58vw, 880px);
     max-width: 92vw;
     max-height: 68vh;
     background: var(--fs-bg);
@@ -1285,6 +1287,24 @@
     font-family: var(--fs-font);
     color: var(--fs-text);
     background: var(--fs-bg);
+}
+
+/* QQ 设置的内容区默认把插件页卡在约 500px，窗口拉大后两边全空着。
+   这里把 LiteLoader 给插件用的那个滚动容器放开，让页面跟着窗口长。
+   只动 .liteloader 这一层（LiteLoader 自己建的），不碰 QQ 原生的设置页。 */
+.setting-main .q-scroll-view.liteloader,
+.setting-main .q-scroll-view.liteloader > .tab-view {
+    width: 100% !important;
+    max-width: none !important;
+    flex: 1 1 auto !important;
+    box-sizing: border-box;
+}
+
+/* 内容也别一行拉太长：居中并限宽，读起来才舒服 */
+.fs-settings {
+    max-width: 920px;
+    margin: 0 auto;
+    box-sizing: border-box;
 }
 
 .fs-row {

@@ -14,3 +14,16 @@ screenshots/local/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 宣传物料（自己发布用，不进公开仓库）
+promo/
+
+# 一键安装包里的第三方本体与插件副本（install.ps1 等脚本源码保留）
+installer/LiteLoader/
+installer/forward-search/
+
+# 单文件安装器的构建中间产物与成品
+build-exe/files/
+build-exe/*.bat
+build-exe/*.sed
+build-exe/*.zip

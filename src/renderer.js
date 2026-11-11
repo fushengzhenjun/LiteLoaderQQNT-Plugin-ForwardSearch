@@ -67,7 +67,10 @@ const STATE = {
     // 上一次搜索实际用的范围，用来判断"当前会话没结果"要不要提示切全部
     scopeUsed: 'current',
     // 排序方式：relevance = 相关度（默认），time = 按时间
-    sortBy: 'relevance'
+    sortBy: 'relevance',
+    // 用户拖过面板之后记住的位置（相对遮罩的像素坐标）。
+    // null = 还没拖过，走默认居中。
+    panelPos: null
 };
 
 /** 把 HTML 特殊字符转义，防止卡片里的文字把界面结构搞坏 */
@@ -571,8 +574,18 @@ const crawler = {
 async function runCrawl() {
     if (crawler.running) return;
     if (!STATE.config || !STATE.config.contentMode) {
-        toast('当前是"仅本地模式"，请先在设置里打开内容补全');
-        return;
+        // 和 startScan 保持一致的口径：别只说"去设置里开"，直接给个能点的选择
+        const yes = confirm(
+            '补全卡片内部内容需要读取历史消息，得先打开「内容补全模式」。\n\n' +
+                '它只影响本插件，不会修改 QQ 的任何设置。\n\n' +
+                '现在打开并开始补全吗？'
+        );
+        if (!yes) return;
+        try {
+            bridge.patchConfig({ contentMode: true });
+        } catch (_) {}
+        STATE.config = Object.assign({}, STATE.config || {}, { contentMode: true });
+        if (ui) renderScopeBar();
     }
     if (!bridge) {
         toast('桥接层未加载，无法补全');
@@ -656,6 +669,38 @@ async function runCrawl() {
  *      位置参数（peer, msgId, cnt, queryOrder）会被直接拒掉（promiseStatue=fail），
  *      等 onMsgInfoListUpdate 事件则永远等不到。
  */
+/* 扫描的统一入口：确认 + 必要时打开内容补全模式 + 开跑。
+ * 默认是「仅本地模式」，不打开 contentMode 扫不了——
+ * 以前只弹一句 toast，新手根本找不到开关在哪，所以在这里一次问清楚。 */
+async function startScan(limit = 200) {
+    if (!bridge) return;
+    if (!bridge.nativeCall) {
+        toast('桥接层不支持直接调用，无法扫描');
+        return;
+    }
+
+    const needMode = !(STATE.config && STATE.config.contentMode);
+    const ok = confirm(
+        '扫描历史会逐个读取你的会话聊天记录，把里面的合并转发卡片收进索引。\n\n' +
+            '这会向 QQ 的服务器发出一些请求，数量取决于你的聊天量。建议在空闲时进行，中途可以点"暂停"。\n\n' +
+            (needMode
+                ? '第一次扫还要打开「内容补全模式」（意思是允许插件主动请求历史消息）。\n只影响本插件，不会改 QQ 的任何设置。\n\n'
+                : '') +
+            '确定开始吗？'
+    );
+    if (!ok) return;
+
+    if (needMode) {
+        try {
+            bridge.patchConfig({ contentMode: true });
+        } catch (_) { /* 内存里先放行，落盘失败也不挡这次扫描 */ }
+        STATE.config = Object.assign({}, STATE.config || {}, { contentMode: true });
+        if (ui) renderScopeBar();
+    }
+
+    await scanHistory(limit);
+}
+
 async function scanHistory(limitPerPeer = 200) {
     if (!bridge) return;
     if (!bridge.nativeCall) {
@@ -663,6 +708,8 @@ async function scanHistory(limitPerPeer = 200) {
         return;
     }
     if (!STATE.config || !STATE.config.contentMode) {
+        // 兜底：正常入口都会先经过 startScan()，那里会把模式打开。
+        // 这里只防有人从别的路径直接调。
         toast('扫描历史需要先打开内容补全模式');
         return;
     }
@@ -1028,13 +1075,7 @@ function buildUi() {
             renderCrawlStatus();
             return;
         }
-        const yes = confirm(
-            '扫描历史会逐个打开你的会话翻看聊天记录，把里面的合并转发卡片收进索引。\n\n' +
-                '这会向 QQ 的服务器发出一些请求，数量取决于你的聊天量。建议在空闲时进行，中途可以点"暂停"。\n\n' +
-                '确定开始吗？'
-        );
-        if (!yes) return;
-        await scanHistory(200);
+        await startScan(200);
     });
 
     // 检索范围：默认跟着眼下打开的这个会话，也可以切成全部会话
@@ -1083,6 +1124,12 @@ function buildUi() {
             moveActive(-1);
         }
     });
+
+    // 实时记住列表滚到哪儿了。只在列表视图里记，
+    // 详情页的滚动不算数，否则回到列表会被带到奇怪的位置。
+    body.addEventListener('scroll', () => {
+        if (STATE.mode === 'search') _listScrollTop = body.scrollTop;
+    }, { passive: true });
 
     ui = { mask, panel, input, body, scope, dockHead };
     return ui;
@@ -1143,6 +1190,11 @@ function makeDraggable(panel, handle) {
             if (handle.releasePointerCapture) {
                 try { handle.releasePointerCapture(e.pointerId); } catch (_) {}
             }
+            // 记住松手时的位置：下次打开、或者从停靠条展开，
+            // 都还停在这儿，不再弹回屏幕中间
+            const l = parseFloat(panel.style.left);
+            const t = parseFloat(panel.style.top);
+            if (isFinite(l) && isFinite(t)) STATE.panelPos = { left: l, top: t };
         };
 
         try { handle.setPointerCapture(e.pointerId); } catch (_) {}
@@ -1151,6 +1203,45 @@ function makeDraggable(panel, handle) {
         handle.addEventListener('pointercancel', onUp);
     });
 }
+
+/* 把面板摆到"上次拖到的位置"。没拖过就保持默认居中。
+ * 注意：必须在 mask 已经 display 之后调用，否则量出来的宽高是 0。
+ * 另外窗口缩放、换分辨率之后，原坐标可能已经在屏幕外，这里顺手夹回可视区。 */
+function applyPanelPos() {
+    if (!ui || !ui.panel || !ui.mask) return;
+    const panel = ui.panel;
+    const mask = ui.mask;
+    const pos = STATE.panelPos;
+
+    if (!pos) {
+        mask.classList.remove('fs-panel-dragging');
+        panel.style.left = '';
+        panel.style.top = '';
+        return;
+    }
+
+    const mw = mask.clientWidth;
+    const mh = mask.clientHeight;
+    const pw = panel.offsetWidth;
+    const ph = panel.offsetHeight;
+    // 尺寸拿不到（还没排版完）就别切绝对定位，否则位置会飘
+    if (!mw || !mh || !pw || !ph) return;
+
+    mask.classList.add('fs-panel-dragging');
+    const left = Math.max(0, Math.min(pos.left, mw - pw));
+    const top = Math.max(0, Math.min(pos.top, mh - ph));
+    panel.style.left = left + 'px';
+    panel.style.top = top + 'px';
+    // 注意不要把这个夹过的值写回 STATE.panelPos：
+    // 窗口临时变小时位置会被压缩，窗口恢复后应该回到用户原本放的地方
+}
+
+// 窗口尺寸变了（缩放、换显示器、QQ 窗口最大化）之后，
+// 原来记的坐标可能已经跑到屏幕外，顺手夹回来。
+window.addEventListener('resize', () => {
+    if (!STATE.open || !ui || isDocked()) return;
+    applyPanelPos();
+});
 
 /** 打开弹窗（异步：样式表要从主进程取） */
 async function openPanel() {
@@ -1170,13 +1261,6 @@ async function openPanel() {
         else doListRecent();
     }
 
-    // 重置拖动状态：每次打开都回到居中，不带上次拖动的位置
-    ui.mask.classList.remove('fs-panel-dragging');
-    if (ui.panel) {
-        ui.panel.style.left = '';
-        ui.panel.style.top = '';
-    }
-
     // 排障用：config 里写了 debugAutoQuery 就自动填好关键词并搜一次，
     // 方便截图/远程看"搜出来长什么样"。默认没有这个配置项。
     if (STATE.config && STATE.config.debugAutoQuery && !STATE.query) {
@@ -1185,6 +1269,8 @@ async function openPanel() {
     }
 
     ui.mask.style.display = 'flex';
+    // 拖过就还在原位，没拖过就居中。放在 display 之后，尺寸才量得准
+    applyPanelPos();
     hideWatchBar();
     STATE.open = true;
     setTimeout(() => ui.input.focus(), 30);
@@ -1261,7 +1347,9 @@ function dockPanel(note) {
 
     STATE.mode = 'search';
     STATE.open = true;
-    // 停靠前清掉拖动残留，让停靠条用 flex 正常摆到右下角
+    // 停靠前清掉拖动残留，让停靠条用 flex 正常摆到右下角。
+    // 注意只清定位，不动 STATE.panelPos —— 那是给"展开"用的，
+    // 展开时要回到用户原来拖到的地方。
     ui.mask.classList.remove('fs-panel-dragging');
     if (ui.panel) {
         ui.panel.style.left = '';
@@ -1276,6 +1364,7 @@ function dockPanel(note) {
     if (text) text.textContent = note || (peer ? `已传送到「${peer.name || peer.peerUid}」` : '已传送');
     if (dot) dot.style.background = peer ? peerColor(peer.peerUid) : 'var(--fs-accent)';
 
+    // 滚动位置交给 renderResultsArea 统一处理（它记着列表滚到哪儿了）
     renderScopeBar();
     renderResultsArea();
 }
@@ -1286,6 +1375,8 @@ function undockPanel() {
     STATE.open = true;
     renderScopeBar();
     renderResultsArea();
+    // 从右下角小条展开时，回到之前拖到的地方（没拖过才居中）
+    applyPanelPos();
     setTimeout(() => ui.input.focus(), 30);
 }
 
@@ -1295,7 +1386,48 @@ function isDocked() {
 
 /* ---------- 各区域的渲染 ---------- */
 
+/* 结果列表重建时保住滚动位置。
+ *
+ * 以前只在"停靠"那一处打补丁，但点一条卡片之后，除了停靠还有别的路径
+ * 会再渲染一次（高亮当前项、刷新计数、统计回写），任何一次重建都会把
+ * innerHTML 换掉，滚动条跟着归零 —— 用户想接着点下一条就得重新往下翻。
+ *
+ * 所以统一在这里做：
+ *   · 列表内容没变（同一查询、同一范围、同一排序、同样的条数）→ 记下位置再放回去
+ *   · 列表换了一批（新搜索、换范围、换排序）→ 老老实实回到顶部
+ */
+let _lastResultSig = '';
+// 列表最后一次的滚动位置。必须实时记录，不能等渲染时再读 ——
+// 点一张卡片会先切到详情页（renderDetail 把 .fs-body 整个换掉），
+// 那时候 DOM 已经不是列表了，scrollTop 早就没了。
+let _listScrollTop = 0;
+
+function resultsSignature() {
+    const r = STATE.results || [];
+    const head = r.length ? String(r[0].id || r[0].msgId || '') : '';
+    return [STATE.query || '', STATE.scope || '', STATE.sortBy || '', r.length, head].join('|');
+}
+
 function renderResultsArea() {
+    if (!ui) return;
+    const sig = resultsSignature();
+    // 换了查询/范围/排序，或者结果集变了 → 该回到顶部，把记录清掉
+    if (sig !== _lastResultSig) _listScrollTop = 0;
+
+    renderResultsAreaCore();
+
+    // 只在列表视图里恢复；详情页有自己的滚动，别掺和
+    if (STATE.mode === 'search' && _listScrollTop > 0 && ui.body) {
+        ui.body.scrollTop = _listScrollTop;
+        if (Math.abs(ui.body.scrollTop - _listScrollTop) > 2) {
+            diag(`[scroll] 想恢复到 ${_listScrollTop}，实际 ${ui.body.scrollTop}`);
+        }
+    }
+
+    _lastResultSig = sig;
+}
+
+function renderResultsAreaCore() {
     if (!ui) return;
     const body = ui.body;
     updateScopeCount();
@@ -1348,7 +1480,7 @@ function renderResultsArea() {
                 scanBtn.addEventListener('click', async () => {
                     scanBtn.disabled = true;
                     scanBtn.textContent = '扫描中…';
-                    await scanHistory(200);
+                    await startScan(200);
                     scanBtn.disabled = false;
                     scanBtn.textContent = '扫描当前会话';
                     renderResultsArea();
